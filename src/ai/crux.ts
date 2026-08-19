@@ -48,7 +48,7 @@ const SYSTEM_PROMPT = `You explain code definitions for a code graph that helps 
 You are given ONE source file with 1-based line numbers, and a list of TARGET definitions in it. Describe EVERY target via the record_symbols tool.
 
 Rules:
-- Return EXACTLY ONE entry for EVERY target id, using that id verbatim. The number of entries you return MUST equal the number of targets. Never omit a target: a reply missing any id is invalid and will be re-requested.
+- Return EXACTLY ONE entry for EVERY target id, using that id verbatim: the id is the text following 'id=' to the END of that target's line, and nothing else. The number of entries you return MUST equal the number of targets. Never omit a target: a reply missing any id is invalid and will be re-requested.
 - A trivial symbol is NOT an exception. You still return it — with a one-sentence summary and crux 0/0 (see below). "Skip" means "give it no crux span", NEVER "leave it out".
 - summary: ONE sentence — what the symbol is FOR at the business-logic level (the problem it solves or the rule it enforces), not a restatement of its signature.
 - crux_start / crux_end: FILE line numbers (as shown), inside that symbol's own line range. Pick the SINGLE most important contiguous span — the core branch, formula, guard, or state change — at most ~8 lines, and NEVER the whole function. When there is no single focal span (a trivial getter, a plain data holder, a one-line delegation, or logic spread evenly), use crux_start: 0 and crux_end: 0. That 0/0 IS the answer — do not drop the entry.`;
@@ -78,25 +78,60 @@ const SYMBOLS_SCHEMA = {
 /** Cap the file text sent per request so one huge file can't blow the context. */
 const MAX_CODE_CHARS = 18_000;
 
-function numberLines(source: string): string {
-  const clipped =
-    source.length > MAX_CODE_CHARS ? `${source.slice(0, MAX_CODE_CHARS)}\n… (truncated)` : source;
-  return clipped
-    .split("\n")
-    .map((line, i) => `${i + 1}\t${line}`)
-    .join("\n");
+/**
+ * The file text a batch needs, as the lines its own targets occupy.
+ *
+ * Sending the head of the file and asking about a symbol defined past the cut
+ * gets one of two answers, and the worse one is silent: the model either says
+ * it cannot find the symbol, or writes a confident summary — with line numbers —
+ * for code it was never shown. Windowing per batch means every target asked
+ * about is present in the text accompanying the question. Line numbers stay
+ * absolute so the crux spans still index the real file.
+ */
+function numberLines(source: string, from: number, to: number): string {
+  const lines = source.split("\n");
+  const start = Math.max(1, Math.min(from, lines.length));
+  const end = Math.min(lines.length, Math.max(to, start));
+  let out = "";
+  let truncated = false;
+  for (let i = start; i <= end; i++) {
+    const next = `${i}\t${lines[i - 1] ?? ""}\n`;
+    if (out.length + next.length > MAX_CODE_CHARS) {
+      truncated = true;
+      break;
+    }
+    out += next;
+  }
+  const header = start > 1 ? `… (file continues above; lines ${start}-${end} shown)\n` : "";
+  return header + out + (truncated ? "… (truncated)" : "");
+}
+
+/** The line range a batch's targets span, so the window covers all of them. */
+function windowFor(nodes: NodeRef[]): { from: number; to: number } {
+  let from = Number.POSITIVE_INFINITY;
+  let to = 0;
+  for (const n of nodes) {
+    from = Math.min(from, n.startLine);
+    to = Math.max(to, n.endLine);
+  }
+  return { from: Number.isFinite(from) ? from : 1, to };
 }
 
 function userContent(input: FileCruxInput): string {
   const targets = input.nodes
     .map(
+      // `id=` runs to end of line, so the id goes LAST. With it in front, a
+      // model copies the whole line — kind and line range included — as the id,
+      // and every entry then fails to match the symbol it describes.
       (n) =>
-        `- id=${n.id} | ${n.kind} | lines L${n.startLine}-L${n.endLine}` +
-        (n.signature ? ` | ${n.signature}` : ""),
+        `- ${n.kind} | lines L${n.startLine}-L${n.endLine}` +
+        (n.signature ? ` | ${n.signature}` : "") +
+        ` | id=${n.id}`,
     )
     .join("\n");
   const n = input.nodes.length;
-  return `FILE: ${input.path}\n\n${numberLines(input.source)}\n\nTARGETS (${n} — return all ${n}, one entry per id):\n${targets}`;
+  const { from, to } = windowFor(input.nodes);
+  return `FILE: ${input.path}\n\n${numberLines(input.source, from, to)}\n\nTARGETS (${n} — return all ${n}, one entry per id):\n${targets}`;
 }
 
 /** Normalize the tool's parsed argument object into a {@link NodeCrux} list. */
@@ -114,12 +149,68 @@ function parseResults(obj: { symbols?: unknown } | undefined): NodeCrux[] {
     }));
 }
 
+/**
+ * Gemini rejects a forced tool call outright once the target list grows past
+ * roughly 30 entries: it answers 200 with `MALFORMED_FUNCTION_CALL`, no tool
+ * call, zero completion tokens, and no error to catch — so every symbol in the
+ * file silently stays `pending`. Twenty is the largest batch measured to hold.
+ * The file source is identical across a file's batches, so prompt caching makes
+ * the extra requests far cheaper than their token counts suggest.
+ */
+const MAX_TARGETS_PER_CALL = 20;
+
+/**
+ * Map each returned entry back onto the id it was asked about.
+ *
+ * An unmatched id costs the symbol its summary silently — it simply stays
+ * `pending`, indistinguishable from one nothing was written for. Models do
+ * decorate ids with the surrounding target text, so an entry whose id starts
+ * with a real id followed by the ` | ` field separator is recovered rather
+ * than dropped. Anything still unrecognised is discarded: a summary attached
+ * to the wrong symbol is worse than a missing one.
+ */
+function reconcileIds(entries: NodeCrux[], nodes: NodeRef[]): NodeCrux[] {
+  const known = new Set(nodes.map((n) => n.id));
+  const out: NodeCrux[] = [];
+  for (const e of entries) {
+    if (known.has(e.id)) {
+      out.push(e);
+      continue;
+    }
+    const head = e.id.split(" | ")[0].trim();
+    if (known.has(head)) out.push({ ...e, id: head });
+  }
+  return out;
+}
+
 /** Crux summarizer backed by any {@link ChatModel} via forced tool calling. */
 export class ChatCruxSummarizer implements CruxSummarizer {
   constructor(private model: ChatModel) {}
 
   async describeFile(input: FileCruxInput): Promise<NodeCrux[]> {
     if (input.nodes.length === 0) return [];
+    const out: NodeCrux[] = [];
+    let refused = 0;
+    // Batch in line order so each window is the tight range around its targets
+    // rather than a span reaching across the whole file.
+    const ordered = [...input.nodes].sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
+    for (let i = 0; i < ordered.length; i += MAX_TARGETS_PER_CALL) {
+      const batch = ordered.slice(i, i + MAX_TARGETS_PER_CALL);
+      const got = await this.describeBatch({ ...input, nodes: batch });
+      if (got === null) refused++;
+      else out.push(...got);
+    }
+    // A refusal carries no error of its own, so a file that produced nothing at
+    // all would otherwise land as "pending" and read exactly like a file with
+    // nothing worth summarizing. Raise it here; partial results still stand.
+    if (out.length === 0 && refused > 0) {
+      throw new Error(`model returned no tool call for ${refused} batch(es)`);
+    }
+    return out;
+  }
+
+  /** Parsed entries, or null when the model answered without a tool call at all. */
+  private async describeBatch(input: FileCruxInput): Promise<NodeCrux[] | null> {
     const res = await this.model.create({
       temperature: 0,
       maxTokens: 8192,
@@ -136,6 +227,8 @@ export class ChatCruxSummarizer implements CruxSummarizer {
         { role: "user", content: userContent(input) },
       ],
     });
-    return parseResults(res.toolCalls[0]?.args as { symbols?: unknown } | undefined);
+    if (res.toolCalls.length === 0) return null;
+    const parsed = parseResults(res.toolCalls[0]?.args as { symbols?: unknown } | undefined);
+    return reconcileIds(parsed, input.nodes);
   }
 }
