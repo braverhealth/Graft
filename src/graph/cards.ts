@@ -148,6 +148,15 @@ function pruneEmptyDirs(outDir: string): void {
  * Write one wiring card per source file into `outDir`, mirroring the source tree,
  * and prune cards whose source no longer exists. Returns what changed.
  */
+/** An existing card's content, or null when it isn't there yet. */
+function readCard(path: string): string | null {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
 export function writeCards(graph: GraphV1, outDir: string): CardStats {
   const byPath = new Map<string, NodeV1[]>();
   for (const n of graph.nodes) {
@@ -164,8 +173,15 @@ export function writeCards(graph: GraphV1, outDir: string): CardStats {
     const fileNode = group.find((n) => n.kind === "file");
     const symbols = group.filter((n) => n.kind !== "file");
     const cardPath = cardPathFor(outDir, sourcePath);
-    mkdirSync(dirname(cardPath), { recursive: true });
-    writeFileSync(cardPath, renderCard(sourcePath, fileNode, symbols, concepts.get(sourcePath) ?? []));
+    const rendered = renderCard(sourcePath, fileNode, symbols, concepts.get(sourcePath) ?? []);
+    // Only write a card whose content actually moved. A build rewrote all of
+    // them unconditionally — on a 12,655-file repo that is seconds of I/O per
+    // build for no change, and it churns the mtime of every card, which any
+    // file watcher pointed at the repo then has to chew through.
+    if (readCard(cardPath) !== rendered) {
+      mkdirSync(dirname(cardPath), { recursive: true });
+      writeFileSync(cardPath, rendered);
+    }
     written.add(cardPath);
     files.push({ card: relPosix(outDir, cardPath), path: sourcePath, symbols: symbols.length });
   }

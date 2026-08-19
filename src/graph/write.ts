@@ -41,7 +41,10 @@ export function writeGraph(graph: GraphV1, outDir: string): string {
   };
   const path = wiringPath(outDir);
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(sorted, null, 2) + "\n");
+  // Compact, not pretty-printed. Nothing reads this by eye — every consumer
+  // JSON.parses it — and on a large graph the indentation is tens of megabytes
+  // that every query pays to read back.
+  writeFileSync(path, JSON.stringify(sorted) + "\n");
   return path;
 }
 

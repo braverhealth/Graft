@@ -16,16 +16,35 @@
 import { readFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { walkDir } from "../ingest/fs.js";
-import { contextDirFor, ensureGitignored, ensureSearchable } from "../context/node-file.js";
-import { extractFile, languageLabelOf, languageOf, warmDepthGrammars, type RawEdge } from "./extract.js";
-import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
-import { containerLangOf, extractContainer, warmContainerGrammars } from "./container.js";
+import {
+  contextDirFor,
+  ensureGitignored,
+  ensureSearchable,
+} from "../context/node-file.js";
+import {
+  extractFile,
+  languageLabelOf,
+  languageOf,
+  warmDepthGrammars,
+  type RawEdge,
+} from "./extract.js";
+import {
+  extractGeneric,
+  genericLangOf,
+  warmGenericGrammars,
+} from "./generic.js";
+import {
+  containerLangOf,
+  extractContainer,
+  warmContainerGrammars,
+} from "./container.js";
 import { contentHash } from "../util/id.js";
 import { relPosix } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
 import { readFollowSubmodules, readIncludeDirs } from "../util/state.js";
 import {
   emptyExtractCache,
+  keepExtractCacheFresh,
   readExtractCache,
   writeExtractCache,
   type ExtractEntry,
@@ -36,10 +55,22 @@ import { listSourceStats } from "./source-files.js";
 import { resolveEdges, type GoModule } from "./resolve.js";
 import { enrichGraph, type EnrichStats } from "./enrich.js";
 import { readGraph, writeGraph, wiringPath } from "./write.js";
-import { writeCards, writeIndex, writeCovers, type CardStats } from "./cards.js";
+import {
+  writeCards,
+  writeIndex,
+  writeCovers,
+  type CardStats,
+} from "./cards.js";
 import { writeAskIndex } from "../ask/index-file.js";
 import { discoverScopes, scopeOf } from "./scopes.js";
-import type { EdgeV1, GraphV1, Kind, NodeV1, Relation, ScopeV1 } from "./types.js";
+import type {
+  EdgeV1,
+  GraphV1,
+  Kind,
+  NodeV1,
+  Relation,
+  ScopeV1,
+} from "./types.js";
 import type { CruxSummarizer } from "../ai/crux.js";
 
 export { listSourceFiles } from "./source-files.js";
@@ -61,7 +92,9 @@ function applyMinSubstanceGuard(scopes: ScopeV1[], nodes: NodeV1[]): ScopeV1[] {
     const scope = scopeOf(node.path, scopes);
     counts.set(scope.prefix, (counts.get(scope.prefix) ?? 0) + 1);
   }
-  const kept = scopes.filter((s) => s.prefix === "" || (counts.get(s.prefix) ?? 0) >= MIN_SCOPE_NODES);
+  const kept = scopes.filter(
+    (s) => s.prefix === "" || (counts.get(s.prefix) ?? 0) >= MIN_SCOPE_NODES,
+  );
   if (kept.length === 0) return [{ prefix: "", label: "", markers: [] }];
   if (kept.length === 1 && kept[0].prefix === "") {
     return [{ prefix: "", label: "", markers: kept[0].markers }];
@@ -180,12 +213,15 @@ export async function buildGraph(
   // keeps its paid-for summaries, instead of being a cold parse of the whole repo.
   // No-ops everywhere else, including on an explicit cold build (`reuse: false`).
   const seed: SeedResult =
-    opts.reuse === false ? { seeded: false } : seedGraph(root, { contextDir: opts.contextDir });
+    opts.reuse === false
+      ? { seeded: false }
+      : seedGraph(root, { contextDir: opts.contextDir });
 
   // Tier-1 memo: unchanged files replay their last parse. `entries` is rebuilt
   // from scratch each run and keyed only by files currently on disk, so deletions
   // fall out of both the cache and the fingerprint with no separate pruning pass.
-  const priorExtract = opts.reuse === false ? emptyExtractCache() : readExtractCache(outDir);
+  const priorExtract =
+    opts.reuse === false ? emptyExtractCache() : readExtractCache(outDir);
   const entries: Record<string, ExtractEntry> = {};
   // The files whose parse did NOT come from the memo. The LSP tier reuses this
   // to ask a language server only about what moved.
@@ -199,20 +235,35 @@ export async function buildGraph(
   // Depth-tier grammars that are WASM (Dart) load asynchronously too, and must
   // be ready before the synchronous parse loop reaches a file that needs one.
   await warmDepthGrammars(
-    files.map((f) => languageOf(f.abs)).filter((l): l is NonNullable<typeof l> => !!l),
+    files
+      .map((f) => languageOf(f.abs))
+      .filter((l): l is NonNullable<typeof l> => !!l),
   );
   await warmGenericGrammars(
-    new Set(files.map((f) => genericLangOf(f.abs)?.name).filter((n): n is string => !!n)),
+    new Set(
+      files
+        .map((f) => genericLangOf(f.abs)?.name)
+        .filter((n): n is string => !!n),
+    ),
   );
   // Container tier (.vue and friends) loads its wrapper grammars the same way,
   // for the same reason: extractContainer runs inside the sync loop below.
   await warmContainerGrammars(
-    new Set(files.map((f) => containerLangOf(f.abs)?.name).filter((n): n is string => !!n)),
+    new Set(
+      files
+        .map((f) => containerLangOf(f.abs)?.name)
+        .filter((n): n is string => !!n),
+    ),
   );
 
   files.forEach((f, i) => {
     const rel = f.rel;
-    opts.onProgress?.({ phase: "parse", index: i, total: files.length, file: rel });
+    opts.onProgress?.({
+      phase: "parse",
+      index: i,
+      total: files.length,
+      file: rel,
+    });
     // Depth tier (hand-written, native grammar) if a language claims the file;
     // otherwise the breadth tier (generic tags.scm over a WASM grammar).
     const lang = languageOf(f.abs);
@@ -221,7 +272,8 @@ export async function buildGraph(
     // breadth tier so a future grammar claiming .vue can't shadow it.
     const container = lang ? null : containerLangOf(f.abs);
     const generic = lang || container ? null : genericLangOf(f.abs);
-    const label = languageLabelOf(f.abs) ?? container?.name ?? generic?.name ?? "unknown";
+    const label =
+      languageLabelOf(f.abs) ?? container?.name ?? generic?.name ?? "unknown";
     const cached = priorExtract.files[rel];
 
     // Every file is read and hashed, every build — only the *parse* is memoized.
@@ -241,13 +293,26 @@ export async function buildGraph(
       errors.push(message);
       // Record it anyway (with the stat we do have) so the freshness probe's
       // fast path doesn't report this file as new on every single query.
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [], error: message };
+      entries[rel] = {
+        size: f.size,
+        mtimeMs: f.mtimeMs,
+        hash: "",
+        nodes: [],
+        rawEdges: [],
+        error: message,
+      };
       return;
     }
     if (source === null) {
       // Unsupported encoding (UTF-16BE) — a skip, never an error: recorded with
       // an empty entry so the freshness probe doesn't treat it as new every run.
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [] };
+      entries[rel] = {
+        size: f.size,
+        mtimeMs: f.mtimeMs,
+        hash: "",
+        nodes: [],
+        rawEdges: [],
+      };
       return;
     }
 
@@ -278,11 +343,24 @@ export async function buildGraph(
       rawEdges.push(...fileEdges);
       sources.set(rel, source);
       langs.add(label);
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: fileNodes, rawEdges: fileEdges };
+      entries[rel] = {
+        size: f.size,
+        mtimeMs: f.mtimeMs,
+        hash,
+        nodes: fileNodes,
+        rawEdges: fileEdges,
+      };
     } catch (err) {
       const message = `${rel}: parse failed — ${err instanceof Error ? err.message : String(err)}`;
       errors.push(message);
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: [], rawEdges: [], error: message };
+      entries[rel] = {
+        size: f.size,
+        mtimeMs: f.mtimeMs,
+        hash,
+        nodes: [],
+        rawEdges: [],
+        error: message,
+      };
     }
   });
 
@@ -292,12 +370,25 @@ export async function buildGraph(
   // and a cold build and an incremental build could disagree. The meaning layer
   // has its own cache (wiring.json itself, keyed on body_hash); this one is
   // strictly about not re-parsing.
-  writeExtractCache(outDir, {
-    ...emptyExtractCache(),
-    files: entries,
-  });
+  // Only rewrite the memo when it would actually differ. Serialising it is
+  // hundreds of megabytes on a large repo, and a build where every file replayed
+  // and none disappeared has nothing new to persist.
+  const memoUnchanged =
+    parsed === 0 &&
+    Object.keys(entries).length === Object.keys(priorExtract.files).length &&
+    Object.keys(entries).every((rel) => rel in priorExtract.files);
+  if (memoUnchanged) {
+    keepExtractCacheFresh(outDir);
+  } else {
+    writeExtractCache(outDir, {
+      ...emptyExtractCache(),
+      files: entries,
+    });
+  }
 
-  const edges = resolveEdges(nodes, rawEdges, { goModules: readGoModules(root, repoFiles) });
+  const edges = resolveEdges(nodes, rawEdges, {
+    goModules: readGoModules(root, repoFiles),
+  });
 
   // graph.json is its own Tier-2 cache: fold in the prior meaning layer so an
   // unchanged body is never re-summarized (and a Tier-1-only run never wipes it).
@@ -332,7 +423,8 @@ export async function buildGraph(
   // touches the extraction cache (Tier-1 stays pristine, cold==incremental).
   if (opts.lsp || opts.lspReplayOnly) {
     const { enrichWithLsp } = await import("./lsp/enrich.js");
-    const { readLspEdgeCache, writeLspEdgeCache, emptyLspEdgeCache } = await import("./lsp/edge-cache.js");
+    const { readLspEdgeCache, writeLspEdgeCache, emptyLspEdgeCache } =
+      await import("./lsp/edge-cache.js");
     const { pickServers } = await import("./lsp/registry.js");
     const { genericLangOf: gl } = await import("./generic.js");
 
@@ -343,13 +435,20 @@ export async function buildGraph(
       const l = gl(n.path)?.name ?? languageLabelOf(n.path);
       if (l) languages.add(l);
     }
-    const serverIds = pickServers(languages).map((sv) => sv.command).sort().join(",");
+    const serverIds = pickServers(languages)
+      .map((sv) => sv.command)
+      .sort()
+      .join(",");
 
     const cold = opts.reuse === false;
-    const prior = cold ? emptyLspEdgeCache(serverIds) : readLspEdgeCache(outDir, serverIds);
+    const prior = cold
+      ? emptyLspEdgeCache(serverIds)
+      : readLspEdgeCache(outDir, serverIds);
     const nodeIds = new Set(graph.nodes.map((n) => n.id));
     const byIdPath = new Map(graph.nodes.map((n) => [n.id, n.path]));
-    const seen = new Set(graph.edges.map((e) => `${e.source}\0${e.relation}\0${e.target}`));
+    const seen = new Set(
+      graph.edges.map((e) => `${e.source}\0${e.relation}\0${e.target}`),
+    );
 
     // Replay the edges of every file that didn't move. An edge is dropped when
     // either end no longer exists, because a *different* file changing can
@@ -357,7 +456,9 @@ export async function buildGraph(
     const carried: Record<string, EdgeV1[]> = {};
     for (const [rel, edges] of Object.entries(prior.files)) {
       if (reparsed.has(rel) || !sources.has(rel)) continue; // changed, or gone from the repo
-      const live = edges.filter((e) => nodeIds.has(e.source) && nodeIds.has(e.target));
+      const live = edges.filter(
+        (e) => nodeIds.has(e.source) && nodeIds.has(e.target),
+      );
       carried[rel] = live;
       for (const e of live) {
         const key = `${e.source}\0${e.relation}\0${e.target}`;
@@ -379,7 +480,13 @@ export async function buildGraph(
           ...[...sources.keys()].filter((rel) => !(rel in prior.files)),
         ]);
     const r = opts.lspReplayOnly
-      ? { added: 0, queried: 0, server: null, addedEdges: [] as EdgeV1[], queriedFiles: new Set<string>() }
+      ? {
+          added: 0,
+          queried: 0,
+          server: null,
+          addedEdges: [] as EdgeV1[],
+          queriedFiles: new Set<string>(),
+        }
       : await enrichWithLsp(graph, root, { onlyFiles });
 
     const next = emptyLspEdgeCache(serverIds);
@@ -400,7 +507,12 @@ export async function buildGraph(
     writeLspEdgeCache(outDir, next);
 
     graph.meta.edgeCount = graph.edges.length;
-    opts.onProgress?.({ phase: "enrich", index: r.added, total: r.queried, file: `lsp:${r.server ?? "none"}` });
+    opts.onProgress?.({
+      phase: "enrich",
+      index: r.added,
+      total: r.queried,
+      file: `lsp:${r.server ?? "none"}`,
+    });
   }
 
   const graphPath = writeGraph(graph, outDir);
@@ -418,7 +530,9 @@ export async function buildGraph(
   try {
     writeAskIndex(outDir, graph);
   } catch (err) {
-    errors.push(`ask-index: ${err instanceof Error ? err.message : String(err)}`);
+    errors.push(
+      `ask-index: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 
   // The fingerprint claims exactly one thing: "the graph on disk was built from
@@ -456,7 +570,8 @@ export async function buildGraph(
   const byKind = {} as Record<Kind, number>;
   for (const n of nodes) byKind[n.kind] = (byKind[n.kind] ?? 0) + 1;
   const byRelation = {} as Record<Relation, number>;
-  for (const e of edges) byRelation[e.relation] = (byRelation[e.relation] ?? 0) + 1;
+  for (const e of edges)
+    byRelation[e.relation] = (byRelation[e.relation] ?? 0) + 1;
 
   return {
     contextDir: outDir,
