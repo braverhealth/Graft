@@ -20,6 +20,30 @@ import { LspClient, type CallHierarchyItem } from "./client.js";
 import { pickServers, type LspServer } from "./registry.js";
 
 const CALLABLE = new Set<NodeV1["kind"]>(["function", "method"]);
+
+/**
+ * Machine-written files, skipped when choosing what to ask a server about.
+ *
+ * They are still parsed, still in the graph, and still carry their AST edges —
+ * this only decides where the expensive question gets asked. On a large Flutter
+ * repo they are 47% of the callable nodes but yield 15% of the edges: 31,226
+ * nodes queried for 15,333 edges, all of it freezed/json boilerplate nobody
+ * traces through. Skipping them is the difference between a cold pass costing
+ * minutes and one costing seconds.
+ */
+const GENERATED =
+  /\.(g|freezed|gr|config|mocks|pb|pbenum|pbjson|pbserver)\.dart$|\.generated\.[jt]sx?$|_pb2\.pyi?$|\.pb\.go$/;
+
+/**
+ * Call-hierarchy requests in flight per server.
+ *
+ * A request costs ~5ms, nearly all of it waiting on the server rather than
+ * burning CPU here, so issuing them one at a time left both sides idle: 66,427
+ * Dart nodes x 5ms is ~330s of pure latency. LSP is request/response with
+ * message ids, so a server answers many at once; this bound overlaps the waits
+ * without burying a slow server.
+ */
+const MAX_IN_FLIGHT = 12;
 const DEFN = new Set<NodeV1["kind"]>(["function", "method", "class", "struct", "interface", "type", "enum"]);
 
 const langOf = (path: string): string | null => genericLangOf(path)?.name ?? languageLabelOf(path);
@@ -121,6 +145,7 @@ async function enrichWithServer(
     (n) =>
       CALLABLE.has(n.kind) &&
       serverLangs.has(langOf(n.path) ?? "") &&
+      !GENERATED.test(n.path) &&
       (!opts.onlyFiles || opts.onlyFiles.has(n.path)),
   );
   if (opts.maxNodes && sources.length > opts.maxNodes) sources = sources.slice(0, opts.maxNodes);
@@ -176,35 +201,53 @@ async function enrichWithServer(
 
   let added = 0, queried = 0;
   try {
-    for (const src of sources) {
-      const abs = join(root, src.path);
-      client.didOpen(abs);
-      const pos = namePos(src);
-      if (!pos) continue;
+    // A bounded pool rather than one-at-a-time. Each node is two round trips
+    // that are almost entirely spent waiting on the server, so serial issuing
+    // left both sides idle for the whole pass. Workers pull from a shared
+    // cursor, which keeps a slow node from stalling the others.
+    //
+    // The shared state below (`existing`, `graph.edges`, the counters) is only
+    // ever touched between awaits on this single thread, and the dedup check and
+    // its push are adjacent with no await between them, so no interleaving can
+    // duplicate an edge.
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const i = cursor++;
+        if (i >= sources.length) return;
+        const src = sources[i];
+        const abs = join(root, src.path);
+        client.didOpen(abs);
+        const pos = namePos(src);
+        if (!pos) continue;
 
-      const items = await client.prepareCallHierarchy(abs, pos);
-      if (!items.length) continue;
-      queried++;
-      opts.onProgress?.(queried, sources.length);
-      const callees = await client.outgoingCalls(items[0]);
-      for (const callee of callees) {
-        let calleeAbs: string;
-        try { calleeAbs = fileURLToPath(callee.uri); } catch { continue; }
-        const rel = relPosix(root, calleeAbs);
-        // In-repo iff the repo-relative path doesn't escape the root. (A raw
-        // `startsWith(root)` is separator-unsafe: root=/a/foo matches /a/foo-bar.)
-        if (rel.startsWith("..") || rel.startsWith("/")) continue; // external/dependency
-        const target = nodeAt(rel, (callee.selectionRange?.start.line ?? callee.range.start.line) + 1);
-        if (!target || target.id === src.id) continue;
-        const key = `${src.id}\0calls\0${target.id}`;
-        if (existing.has(key)) continue;
-        existing.add(key);
-        const edge = { source: src.id, target: target.id, relation: "calls", confidence: "lsp_resolved" } as EdgeV1;
-        graph.edges.push(edge);
-        addedEdges.push(edge);
-        added++;
+        const items = await client.prepareCallHierarchy(abs, pos);
+        if (!items.length) continue;
+        queried++;
+        opts.onProgress?.(queried, sources.length);
+        const callees = await client.outgoingCalls(items[0]);
+        for (const callee of callees) {
+          let calleeAbs: string;
+          try { calleeAbs = fileURLToPath(callee.uri); } catch { continue; }
+          const rel = relPosix(root, calleeAbs);
+          // In-repo iff the repo-relative path doesn't escape the root. (A raw
+          // `startsWith(root)` is separator-unsafe: root=/a/foo matches /a/foo-bar.)
+          if (rel.startsWith("..") || rel.startsWith("/")) continue; // external/dependency
+          const target = nodeAt(rel, (callee.selectionRange?.start.line ?? callee.range.start.line) + 1);
+          if (!target || target.id === src.id) continue;
+          const key = `${src.id}\0calls\0${target.id}`;
+          if (existing.has(key)) continue;
+          existing.add(key);
+          const edge = { source: src.id, target: target.id, relation: "calls", confidence: "lsp_resolved" } as EdgeV1;
+          graph.edges.push(edge);
+          addedEdges.push(edge);
+          added++;
+        }
       }
-    }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(MAX_IN_FLIGHT, sources.length) }, () => worker()),
+    );
   } finally {
     await client.dispose().catch(() => { /* already gone */ });
   }
