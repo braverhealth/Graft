@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, copyFileSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { hooksShim } from '../src/claude/shim-template.js';
@@ -31,13 +31,40 @@ function fakeInstall(root: string, name: string, version: string): string {
   return distClaude;
 }
 
+/**
+ * A node to run the shim with whose `../lib` holds no graft.
+ *
+ * One of the shim's candidates is `dirname(process.execPath)/../lib`, which is
+ * where a global npm install sits on most layouts. Running these tests with the
+ * real node therefore puts the machine's own installed graft into the candidate
+ * list, and since the shim (correctly) takes the highest version, a real 0.11.0
+ * beats a 0.9.1 fixture and the fixture never loads — so the assertions failed
+ * on any machine that had graft installed, which is every machine that uses it.
+ *
+ * A copy of the binary in a temp bin/ moves `process.execPath` somewhere whose
+ * sibling lib/ is empty, leaving the fixtures as the only candidates. It has to
+ * be a copy rather than a symlink: node reports the resolved real path in
+ * `process.execPath`, so a link would point straight back at the real layout.
+ */
+function isolatedNode(root: string): string {
+  const bin = join(root, 'node-home', 'bin');
+  mkdirSync(bin, { recursive: true });
+  mkdirSync(join(root, 'node-home', 'lib'), { recursive: true });
+  const copy = join(bin, 'node');
+  if (!existsSync(copy)) {
+    copyFileSync(process.execPath, copy);
+    chmodSync(copy, 0o755);
+  }
+  return copy;
+}
+
 /** Runs the shim with the given baked dir and project dir; returns the version
  * of the install that actually got loaded (or null if none did). */
 function runShim(root: string, bakedDir: string, projectDir: string): string | null {
   const shimPath = join(root, 'graft-hooks.cjs');
   const marker = join(root, 'loaded.txt');
   writeFileSync(shimPath, hooksShim(bakedDir));
-  const res = spawnSync(process.execPath, [shimPath, 'session-start'], {
+  const res = spawnSync(isolatedNode(root), [shimPath, 'session-start'], {
     encoding: 'utf8',
     env: { ...process.env, MARKER: marker, CLAUDE_PROJECT_DIR: projectDir },
   });
