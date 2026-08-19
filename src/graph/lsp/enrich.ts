@@ -17,7 +17,7 @@ import { languageLabelOf } from "../extract.js";
 import { genericLangOf } from "../generic.js";
 import type { GraphV1, NodeV1, EdgeV1 } from "../types.js";
 import { LspClient, type CallHierarchyItem } from "./client.js";
-import { pickServer } from "./registry.js";
+import { pickServers, type LspServer } from "./registry.js";
 
 const CALLABLE = new Set<NodeV1["kind"]>(["function", "method"]);
 const DEFN = new Set<NodeV1["kind"]>(["function", "method", "class", "struct", "interface", "type", "enum"]);
@@ -39,8 +39,33 @@ export async function enrichWithLsp(
 ): Promise<LspEnrichResult> {
   const languagesPresent = new Set<string>();
   for (const n of graph.nodes) { const l = langOf(n.path); if (l) languagesPresent.add(l); }
-  const server = pickServer(languagesPresent);
-  if (!server) return { added: 0, queried: 0, server: null };
+  const servers = pickServers(languagesPresent);
+  if (!servers.length) return { added: 0, queried: 0, server: null };
+
+  let added = 0, queried = 0;
+  const used: string[] = [];
+  for (const server of servers) {
+    // One server's failure must not cost the others their edges, nor abort the
+    // build: this tier is opt-in enrichment on top of a graph that already
+    // stands on its own. A server that dies mid-request rejects from inside the
+    // JSON-RPC writer, which is why this catch has to wrap the whole pass and
+    // not just the spawn.
+    try {
+      const r = await enrichWithServer(graph, root, server, opts);
+      added += r.added;
+      queried += r.queried;
+      if (r.queried > 0) used.push(server.command);
+    } catch { /* leave the graph as the AST tier built it */ }
+  }
+  return { added, queried, server: used.join(", ") || servers[0].command };
+}
+
+async function enrichWithServer(
+  graph: GraphV1,
+  root: string,
+  server: LspServer,
+  opts: { onProgress?: (done: number, total: number) => void; maxNodes?: number },
+): Promise<LspEnrichResult> {
 
   // Canonicalize the root: servers (rust-analyzer/clangd) report callee URIs
   // against the REAL path, so under a symlinked checkout (macOS /tmp →
@@ -108,33 +133,36 @@ export async function enrichWithLsp(
   }
 
   let added = 0, queried = 0;
-  for (const src of sources) {
-    const abs = join(root, src.path);
-    client.didOpen(abs);
-    const pos = namePos(src);
-    if (!pos) continue;
+  try {
+    for (const src of sources) {
+      const abs = join(root, src.path);
+      client.didOpen(abs);
+      const pos = namePos(src);
+      if (!pos) continue;
 
-    const items = await client.prepareCallHierarchy(abs, pos);
-    if (!items.length) continue;
-    queried++;
-    opts.onProgress?.(queried, sources.length);
-    const callees = await client.outgoingCalls(items[0]);
-    for (const callee of callees) {
-      let calleeAbs: string;
-      try { calleeAbs = fileURLToPath(callee.uri); } catch { continue; }
-      const rel = relPosix(root, calleeAbs);
-      // In-repo iff the repo-relative path doesn't escape the root. (A raw
-      // `startsWith(root)` is separator-unsafe: root=/a/foo matches /a/foo-bar.)
-      if (rel.startsWith("..") || rel.startsWith("/")) continue; // external/dependency
-      const target = nodeAt(rel, (callee.selectionRange?.start.line ?? callee.range.start.line) + 1);
-      if (!target || target.id === src.id) continue;
-      const key = `${src.id}\0calls\0${target.id}`;
-      if (existing.has(key)) continue;
-      existing.add(key);
-      graph.edges.push({ source: src.id, target: target.id, relation: "calls", confidence: "lsp_resolved" } as EdgeV1);
-      added++;
+      const items = await client.prepareCallHierarchy(abs, pos);
+      if (!items.length) continue;
+      queried++;
+      opts.onProgress?.(queried, sources.length);
+      const callees = await client.outgoingCalls(items[0]);
+      for (const callee of callees) {
+        let calleeAbs: string;
+        try { calleeAbs = fileURLToPath(callee.uri); } catch { continue; }
+        const rel = relPosix(root, calleeAbs);
+        // In-repo iff the repo-relative path doesn't escape the root. (A raw
+        // `startsWith(root)` is separator-unsafe: root=/a/foo matches /a/foo-bar.)
+        if (rel.startsWith("..") || rel.startsWith("/")) continue; // external/dependency
+        const target = nodeAt(rel, (callee.selectionRange?.start.line ?? callee.range.start.line) + 1);
+        if (!target || target.id === src.id) continue;
+        const key = `${src.id}\0calls\0${target.id}`;
+        if (existing.has(key)) continue;
+        existing.add(key);
+        graph.edges.push({ source: src.id, target: target.id, relation: "calls", confidence: "lsp_resolved" } as EdgeV1);
+        added++;
+      }
     }
+  } finally {
+    await client.dispose().catch(() => { /* already gone */ });
   }
-  await client.dispose();
   return { added, queried, server: server.command };
 }

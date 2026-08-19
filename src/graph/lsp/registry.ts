@@ -41,10 +41,24 @@ function resolveCommand(cmd: string): string | null {
  * languages present in the repo, with `command` resolved to an absolute path.
  * Returns null if none is installed. */
 export function pickServer(languagesPresent: Set<string>): LspServer | null {
+  return pickServers(languagesPresent)[0] ?? null;
+}
+
+/** EVERY installed server covering a language in the repo, in registry order,
+ * with each `command` resolved to an absolute path.
+ *
+ * A polyglot repo has more than one, and picking only the first leaves the rest
+ * of its languages unenriched for no reason: the rows are disjoint in the
+ * languages they claim, so running all of them is strictly more coverage, not a
+ * conflict. It also stops an unrelated language from deciding the outcome — a
+ * Dart repo carrying a handful of `.c` files got clangd, because clangd sorts
+ * first, and Dart went unenriched. */
+export function pickServers(languagesPresent: Set<string>): LspServer[] {
+  const out: LspServer[] = [];
   for (const s of LSP_SERVERS) {
     if (!s.languages.some((l) => languagesPresent.has(l))) continue;
     const abs = resolveCommand(s.command);
-    if (abs) return { ...s, command: abs };
+    if (abs) out.push({ ...s, command: abs });
   }
-  return null;
+  return out;
 }
