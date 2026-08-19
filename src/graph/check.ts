@@ -117,6 +117,9 @@ export async function checkGraph(
   return result;
 }
 
+/** Ids listed per drift section before the rest are summarized as a count. */
+const MAX_LISTED = 50;
+
 /** Render a graph-check result as a human-readable report. */
 export function formatGraphCheckReport(r: GraphCheckResult): string {
   if (r.missing) {
@@ -129,22 +132,22 @@ export function formatGraphCheckReport(r: GraphCheckResult): string {
 
   const lines: string[] = ["graph check: STALE", ""];
   const structural = r.added.length + r.removed.length + r.changed.length;
-  if (r.changed.length) {
-    lines.push(`changed (${r.changed.length}):`);
-    for (const id of r.changed) lines.push(`  ~ ${id}`);
-  }
-  if (r.added.length) {
-    lines.push(`added (${r.added.length}):`);
-    for (const id of r.added) lines.push(`  + ${id}`);
-  }
-  if (r.removed.length) {
-    lines.push(`removed (${r.removed.length}):`);
-    for (const id of r.removed) lines.push(`  - ${id}`);
-  }
-  if (r.stale.length) {
-    lines.push(`stale summaries (${r.stale.length}):`);
-    for (const id of r.stale) lines.push(`  ! ${id}`);
-  }
+  // The report is read to decide whether to rebuild, and the count answers that
+  // on its own; the ids are there to make the drift recognizable. Listing all of
+  // them scales with the repo instead of with the drift — a first build of a
+  // 161k-node repo emitted 137,477 lines and 12.7 MB, which no terminal and no
+  // tool-output budget can take. Cap each section and say what was withheld.
+  const section = (label: string, ids: string[], marker: string): void => {
+    if (!ids.length) return;
+    lines.push(`${label} (${ids.length}):`);
+    for (const id of ids.slice(0, MAX_LISTED)) lines.push(`  ${marker} ${id}`);
+    const withheld = ids.length - MAX_LISTED;
+    if (withheld > 0) lines.push(`  … and ${withheld} more`);
+  };
+  section("changed", r.changed, "~");
+  section("added", r.added, "+");
+  section("removed", r.removed, "-");
+  section("stale summaries", r.stale, "!");
   lines.push("");
   if (structural) lines.push("Run `graft build` to rebuild the structure, then commit graft/.");
   if (r.stale.length) lines.push("Run `graft build --deep` to refresh stale summaries.");
