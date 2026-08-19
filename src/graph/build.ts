@@ -506,6 +506,19 @@ export async function buildGraph(
     for (const rel of r.queriedFiles) {
       next.files[rel] = { hash: entries[rel]?.hash ?? "", edges: [] };
     }
+    // Record every file this pass CONSIDERED, not just the ones it had something
+    // to ask about. A file with no callables, or one in a language no installed
+    // server covers, otherwise stays "never asked" forever: it lands in the
+    // backfill set on every later build, which keeps that set non-empty and
+    // respawns a language server — 58s of workspace indexing — on a build where
+    // nothing changed at all.
+    if (!opts.lspReplayOnly) {
+      for (const rel of sources.keys()) {
+        if (reparsed.has(rel) || !(rel in prior.files)) {
+          next.files[rel] ??= { hash: entries[rel]?.hash ?? "", edges: [] };
+        }
+      }
+    }
     for (const e of r.addedEdges) {
       const rel = byIdPath.get(e.source);
       if (!rel) continue;
