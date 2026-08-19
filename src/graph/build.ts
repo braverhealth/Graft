@@ -85,6 +85,13 @@ export interface GraphBuildOptions {
    * calls, breadth-tier calls). Off by default — needs a server on PATH and is
    * slower; the graph is fully functional without it. */
   lsp?: boolean;
+  /** Replay memoized LSP edges but never consult a language server. The
+   * automatic refresh path sets this: it runs under a hook timeout measured in
+   * seconds, while spawning a server costs tens of seconds before it answers
+   * anything (it has to index the workspace first). Replaying keeps the edges a
+   * previous explicit `--lsp` build derived; the files that changed simply carry
+   * none until the next such build. */
+  lspReplayOnly?: boolean;
   /** Run the Tier-2 LLM meaning pass. Absent → Tier-1 only (cache is still preserved). */
   summarizer?: CruxSummarizer;
   /** Max files summarized in parallel during the Tier-2 pass. Default is set in enrich. */
@@ -318,7 +325,7 @@ export async function buildGraph(
   // Opt-in compiler-grade enrichment (adds lsp_resolved call edges in place).
   // Runs on the assembled graph so callee positions map back to nodes; never
   // touches the extraction cache (Tier-1 stays pristine, cold==incremental).
-  if (opts.lsp) {
+  if (opts.lsp || opts.lspReplayOnly) {
     const { enrichWithLsp } = await import("./lsp/enrich.js");
     const { readLspEdgeCache, writeLspEdgeCache, emptyLspEdgeCache } = await import("./lsp/edge-cache.js");
     const { pickServers } = await import("./lsp/registry.js");
@@ -356,12 +363,22 @@ export async function buildGraph(
     }
 
     // Ask the servers about the rest. On a cold build that is every file, which
-    // is exactly today's behaviour.
+    // is exactly today's behaviour. Under replay-only nothing is asked at all.
     const onlyFiles = cold ? undefined : reparsed;
-    const r = await enrichWithLsp(graph, root, { onlyFiles });
+    const r = opts.lspReplayOnly
+      ? { added: 0, queried: 0, server: null, addedEdges: [] as EdgeV1[], queriedFiles: new Set<string>() }
+      : await enrichWithLsp(graph, root, { onlyFiles });
 
     const next = emptyLspEdgeCache(serverIds);
     next.files = carried;
+    if (opts.lspReplayOnly) {
+      // Nothing was re-derived, so keep what a changed file had rather than
+      // erasing it — the next explicit `--lsp` build replaces it wholesale.
+      for (const rel of reparsed) {
+        const held = prior.files[rel];
+        if (held) next.files[rel] = held;
+      }
+    }
     for (const rel of r.queriedFiles) next.files[rel] = [];
     for (const e of r.addedEdges) {
       const rel = byIdPath.get(e.source);

@@ -124,3 +124,64 @@ test("a cold build ignores the memo entirely", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("replay-only keeps memoized edges and never consults a server", async () => {
+  const dir = repo();
+  try {
+    const out = join(dir, "graft");
+    await buildGraph(dir, {});
+    const before = readGraph(wiringPath(out))!;
+    const alpha = before.nodes.find((n) => n.id.endsWith("#alpha"))!.id;
+    const beta = before.nodes.find((n) => n.id.endsWith("#beta"))!.id;
+
+    const seeded = emptyLspEdgeCache("");
+    seeded.files["src/a.ts"] = [
+      { source: alpha, target: beta, relation: "calls", confidence: "lsp_resolved" } as EdgeV1,
+    ];
+    writeLspEdgeCache(out, seeded);
+
+    // Change the file, so a querying build would have to re-derive its edges.
+    writeFileSync(join(dir, "src", "a.ts"), SRC + "\nexport function gamma(): number { return beta(); }\n");
+
+    await buildGraph(dir, { lspReplayOnly: true });
+    const after = readGraph(wiringPath(out))!;
+
+    // The edge belonged to the file that changed, so it is not replayed into the
+    // graph — but it is also not erased from the memo, because nothing
+    // re-derived it. The next explicit --lsp build is what replaces it.
+    assert.ok(after.nodes.some((n) => n.id.endsWith("#gamma")), "the new definition is indexed");
+    assert.deepEqual(readLspEdgeCache(out, "").files["src/a.ts"], seeded.files["src/a.ts"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("replay-only replays an unchanged file's edges", async () => {
+  const dir = repo();
+  try {
+    const out = join(dir, "graft");
+    mkdirSync(join(dir, "src"), { recursive: true });
+    writeFileSync(join(dir, "src", "b.ts"), "export function other(): number { return 2; }\n");
+    await buildGraph(dir, {});
+    const before = readGraph(wiringPath(out))!;
+    const alpha = before.nodes.find((n) => n.id.endsWith("#alpha"))!.id;
+    const beta = before.nodes.find((n) => n.id.endsWith("#beta"))!.id;
+
+    const seeded = emptyLspEdgeCache("");
+    seeded.files["src/a.ts"] = [
+      { source: alpha, target: beta, relation: "calls", confidence: "lsp_resolved" } as EdgeV1,
+    ];
+    writeLspEdgeCache(out, seeded);
+
+    // Touch a DIFFERENT file: a.ts is unchanged, so its edges must survive.
+    writeFileSync(join(dir, "src", "b.ts"), "export function other(): number { return 3; }\n");
+
+    await buildGraph(dir, { lspReplayOnly: true });
+    const after = readGraph(wiringPath(out))!;
+    const carried = after.edges.filter((e) => e.confidence === "lsp_resolved");
+    assert.equal(carried.length, 1, "the untouched file's edge survived the refresh");
+    assert.equal(carried[0].source, alpha);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

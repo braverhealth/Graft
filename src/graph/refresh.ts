@@ -209,11 +209,18 @@ export async function ensureFreshGraph(root: string, opts: RefreshOptions = {}):
       // else. The markdown projections under `graft/` stay the `Stop` hook's job —
       // a query has no business rewriting the repo's `.gitignore` or churning every
       // card's mtime, and skipping them is most of what keeps this cheap.
-      // Honour the repo's persisted `--lsp` choice. A refresh never sees a CLI
-      // flag, so without this the first edit after an explicit `--lsp` build
-      // silently rebuilds without the compiler-grade edges it added — on a large
-      // Dart repo that is ~100k edges disappearing on the next keystroke.
-      await buildGraph(dir, { contextDir: opts.contextDir, graphOnly: true, lsp: readLspEnabled(dir) });
+      // Honour the repo's persisted `--lsp` choice, but REPLAY only. Without
+      // this the first edit after an explicit `--lsp` build silently rebuilds
+      // without the compiler-grade edges it added — on a large Dart repo that is
+      // ~100k edges disappearing on the next keystroke. Actually consulting a
+      // server here is not an option: it costs tens of seconds before it answers
+      // anything (it indexes the workspace first), and this runs under a hook
+      // timeout measured in seconds. Replaying is ~1s and keeps the edges.
+      await buildGraph(dir, {
+        contextDir: opts.contextDir,
+        graphOnly: true,
+        lspReplayOnly: readLspEnabled(dir),
+      });
       invalidateGraphCaches(outDir);
       return { refreshed: true, drift: drift ?? undefined, note: seedNote };
     } finally {
