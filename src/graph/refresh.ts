@@ -34,7 +34,7 @@
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { contextDirFor } from "../context/node-file.js";
-import { acquireLockIn, releaseLockIn } from "../util/state.js";
+import { acquireLockIn, readLspEnabled, releaseLockIn } from "../util/state.js";
 import { CACHE_DIR } from "../context/node-file.js";
 import { buildGraph } from "./build.js";
 import { driftCount, isClean, probeDrift, type Drift } from "./fingerprint.js";
@@ -209,7 +209,11 @@ export async function ensureFreshGraph(root: string, opts: RefreshOptions = {}):
       // else. The markdown projections under `graft/` stay the `Stop` hook's job —
       // a query has no business rewriting the repo's `.gitignore` or churning every
       // card's mtime, and skipping them is most of what keeps this cheap.
-      await buildGraph(dir, { contextDir: opts.contextDir, graphOnly: true });
+      // Honour the repo's persisted `--lsp` choice. A refresh never sees a CLI
+      // flag, so without this the first edit after an explicit `--lsp` build
+      // silently rebuilds without the compiler-grade edges it added — on a large
+      // Dart repo that is ~100k edges disappearing on the next keystroke.
+      await buildGraph(dir, { contextDir: opts.contextDir, graphOnly: true, lsp: readLspEnabled(dir) });
       invalidateGraphCaches(outDir);
       return { refreshed: true, drift: drift ?? undefined, note: seedNote };
     } finally {

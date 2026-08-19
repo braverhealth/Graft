@@ -16,6 +16,7 @@ import {
   readBuildConfig,
   readFollowSubmodules,
   readIncludeDirs,
+  readLspEnabled,
   writeBuildConfig,
 } from "../src/util/state.js";
 
@@ -46,6 +47,29 @@ test("readIncludeDirs turns a persisted list into a Set; an empty persisted list
 
   writeBuildConfig(d, { includeDirs: [] });
   assert.equal(readIncludeDirs(d), undefined, "an empty list must read exactly like no list at all");
+});
+
+test("the lsp choice round-trips, and defaults to off", () => {
+  const d = fresh();
+  // A repo that never passed --lsp must be unaffected.
+  assert.equal(readLspEnabled(d), false, "no persisted config -> no enrichment");
+
+  writeBuildConfig(d, { lsp: true });
+  assert.equal(readLspEnabled(d), true);
+
+  // Explicit --no-lsp turns it back off rather than leaving it latched on.
+  writeBuildConfig(d, { lsp: false });
+  assert.equal(readLspEnabled(d), false);
+});
+
+test("patching lsp leaves the other persisted choices alone", () => {
+  const d = fresh();
+  writeBuildConfig(d, { includeDirs: ["build"], followSubmodules: true });
+  patchBuildConfig(d, { lsp: true });
+  assert.deepEqual(readBuildConfig(d), { includeDirs: ["build"], followSubmodules: true, lsp: true });
+  assert.equal(readLspEnabled(d), true);
+  assert.equal(readFollowSubmodules(d), true);
+  assert.deepEqual([...readIncludeDirs(d)!], ["build"]);
 });
 
 test("followSubmodules round-trips true and explicit false", () => {
