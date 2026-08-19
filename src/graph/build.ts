@@ -39,7 +39,7 @@ import { readGraph, writeGraph, wiringPath } from "./write.js";
 import { writeCards, writeIndex, writeCovers, type CardStats } from "./cards.js";
 import { writeAskIndex } from "../ask/index-file.js";
 import { discoverScopes, scopeOf } from "./scopes.js";
-import type { GraphV1, Kind, NodeV1, Relation, ScopeV1 } from "./types.js";
+import type { EdgeV1, GraphV1, Kind, NodeV1, Relation, ScopeV1 } from "./types.js";
 import type { CruxSummarizer } from "../ai/crux.js";
 
 export { listSourceFiles } from "./source-files.js";
@@ -180,6 +180,9 @@ export async function buildGraph(
   // fall out of both the cache and the fingerprint with no separate pruning pass.
   const priorExtract = opts.reuse === false ? emptyExtractCache() : readExtractCache(outDir);
   const entries: Record<string, ExtractEntry> = {};
+  // The files whose parse did NOT come from the memo. The LSP tier reuses this
+  // to ask a language server only about what moved.
+  const reparsed = new Set<string>();
   let parsed = 0;
   let reused = 0;
 
@@ -252,6 +255,7 @@ export async function buildGraph(
     }
 
     parsed++;
+    reparsed.add(rel);
     try {
       const { nodes: fileNodes, rawEdges: fileEdges } = lang
         ? extractFile(rel, source, lang)
@@ -316,7 +320,55 @@ export async function buildGraph(
   // touches the extraction cache (Tier-1 stays pristine, cold==incremental).
   if (opts.lsp) {
     const { enrichWithLsp } = await import("./lsp/enrich.js");
-    const r = await enrichWithLsp(graph, root);
+    const { readLspEdgeCache, writeLspEdgeCache, emptyLspEdgeCache } = await import("./lsp/edge-cache.js");
+    const { pickServers } = await import("./lsp/registry.js");
+    const { genericLangOf: gl } = await import("./generic.js");
+
+    // Identity of the servers that would run, so a change in what's installed
+    // invalidates the memo rather than freezing one server's edges in place.
+    const languages = new Set<string>();
+    for (const n of graph.nodes) {
+      const l = gl(n.path)?.name ?? languageLabelOf(n.path);
+      if (l) languages.add(l);
+    }
+    const serverIds = pickServers(languages).map((sv) => sv.command).sort().join(",");
+
+    const cold = opts.reuse === false;
+    const prior = cold ? emptyLspEdgeCache(serverIds) : readLspEdgeCache(outDir, serverIds);
+    const nodeIds = new Set(graph.nodes.map((n) => n.id));
+    const byIdPath = new Map(graph.nodes.map((n) => [n.id, n.path]));
+    const seen = new Set(graph.edges.map((e) => `${e.source}\0${e.relation}\0${e.target}`));
+
+    // Replay the edges of every file that didn't move. An edge is dropped when
+    // either end no longer exists, because a *different* file changing can
+    // delete the node this one pointed at.
+    const carried: Record<string, EdgeV1[]> = {};
+    for (const [rel, edges] of Object.entries(prior.files)) {
+      if (reparsed.has(rel) || !sources.has(rel)) continue; // changed, or gone from the repo
+      const live = edges.filter((e) => nodeIds.has(e.source) && nodeIds.has(e.target));
+      carried[rel] = live;
+      for (const e of live) {
+        const key = `${e.source}\0${e.relation}\0${e.target}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        graph.edges.push(e);
+      }
+    }
+
+    // Ask the servers about the rest. On a cold build that is every file, which
+    // is exactly today's behaviour.
+    const onlyFiles = cold ? undefined : reparsed;
+    const r = await enrichWithLsp(graph, root, { onlyFiles });
+
+    const next = emptyLspEdgeCache(serverIds);
+    next.files = carried;
+    for (const rel of r.queriedFiles) next.files[rel] = [];
+    for (const e of r.addedEdges) {
+      const rel = byIdPath.get(e.source);
+      if (rel) (next.files[rel] ??= []).push(e);
+    }
+    writeLspEdgeCache(outDir, next);
+
     graph.meta.edgeCount = graph.edges.length;
     opts.onProgress?.({ phase: "enrich", index: r.added, total: r.queried, file: `lsp:${r.server ?? "none"}` });
   }
