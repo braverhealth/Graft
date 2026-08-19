@@ -51,7 +51,9 @@ test("memo round-trips, and its identity invalidates it", () => {
   try {
     const out = join(dir, "graft");
     mkdirSync(join(out, ".cache"), { recursive: true });
-    assert.ok(lspCachePath(out), "a stamped path exists");
+    // Deliberately unstamped: this memo must be readable by any version, since
+    // every entry carries the hash that proves it still applies.
+    assert.ok(lspCachePath(out).endsWith("lsp.json"), "one file, no extractor stamp");
 
     const cache = emptyLspEdgeCache("dart");
     cache.files["src/a.ts"] = [

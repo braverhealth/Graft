@@ -96,18 +96,25 @@ export function emptyLspEdgeCache(servers = ""): LspEdgeCache {
   return { version: CACHE_VERSION, extractor: extractorStamp() ?? "", servers, files: {} };
 }
 
-/** Null stamp → null path → no memo, exactly as the extraction memo behaves. */
-export function lspCachePath(outDir: string): string | null {
-  const stamp = extractorStamp();
-  return stamp === null ? null : join(outDir, CACHE_DIR, `${LSP_CACHE_PREFIX}.${stamp}.json`);
+/**
+ * One file, with no extractor stamp in its name.
+ *
+ * The parse memo stamps its filename because a different graft parses
+ * differently, so two versions must not read each other's entries. This memo is
+ * the opposite: every entry is verified against the content hash of the file it
+ * came from, which no version of graft changes. Stamping the name here only
+ * meant that upgrading — or seeding a worktree from a parent on another version
+ * — silently started from nothing and paid the whole query pass again, which on
+ * a large repo is minutes.
+ */
+export function lspCachePath(outDir: string): string {
+  return join(outDir, CACHE_DIR, `${LSP_CACHE_PREFIX}.json`);
 }
 
 /** The memo for `servers`, or an empty one when anything about its identity
  * differs. Never throws: a cache that can't be read is a cache miss. */
 export function readLspEdgeCache(outDir: string, servers: string): LspEdgeCache {
-  const path = lspCachePath(outDir);
-  if (!path) return emptyLspEdgeCache(servers);
-  const raw = readJson<LspEdgeCache>(path);
+  const raw = readJson<LspEdgeCache>(lspCachePath(outDir));
   if (!raw || raw.version !== CACHE_VERSION) return emptyLspEdgeCache(servers);
   // NOT invalidated by a change of extractor. An LSP edge states that one span
   // of source calls another, which upgrading graft does not alter; what would
@@ -124,7 +131,6 @@ export function readLspEdgeCache(outDir: string, servers: string): LspEdgeCache 
 
 export function writeLspEdgeCache(outDir: string, cache: LspEdgeCache): void {
   const path = lspCachePath(outDir);
-  if (!path) return;
   try {
     writeJsonAtomic(path, cache, true);
   } catch {

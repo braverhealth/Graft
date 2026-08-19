@@ -339,3 +339,32 @@ test("`graft build` in a worktree starts from the parent's graph, not from scrat
   rmSync(main, { recursive: true, force: true });
   rmSync(wt, { recursive: true, force: true });
 });
+
+test("the language server's answers travel to a new worktree", () => {
+  // They are the expensive half to re-derive — minutes of querying on a large
+  // repo — and they hold in a worktree for the same reason the parse memo does:
+  // every entry is keyed by the content hash of a repo-relative path, which a
+  // worktree of the same repository shares.
+  const { main, wt } = fakePair();
+  const mainCache = join(main, "graft", ".cache");
+  mkdirSync(mainCache, { recursive: true });
+  mkdirSync(join(main, "graft", ".graph"), { recursive: true });
+  writeFileSync(
+    join(main, "graft", ".graph", "wiring.json"),
+    JSON.stringify({ meta: { version: 1 }, nodes: [], edges: [] }),
+  );
+  writeFileSync(join(mainCache, "lsp.abc123.json"), '{"version":2,"files":{}}');
+  // Local-only bookkeeping that must NOT travel: it describes the parent's own
+  // sync state, not anything about the code.
+  writeFileSync(join(mainCache, "stats.json"), "{}");
+
+  assert.ok(seedGraph(wt).seeded, "the worktree was seeded");
+  assert.ok(
+    existsSync(join(wt, "graft", ".cache", "lsp.abc123.json")),
+    "the server's answers came along",
+  );
+  assert.ok(
+    !existsSync(join(wt, "graft", ".cache", "stats.json")),
+    "the parent's local stats did not",
+  );
+});
