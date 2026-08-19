@@ -8,6 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { pickServer, pickServers, LSP_SERVERS } from "../src/graph/lsp/registry.js";
 import { enrichWithLsp } from "../src/graph/lsp/enrich.js";
+import { LspClient } from "../src/graph/lsp/client.js";
 import type { GraphV1 } from "../src/graph/types.js";
 
 test("pickServer: no languages present → no server", () => {
@@ -63,4 +64,23 @@ test("enrichWithLsp is a no-op when no server matches the repo's languages", asy
   assert.equal(r.server, null, "no server selected for an unsupported language");
   assert.equal(r.added, 0);
   assert.equal(graph.edges.length, before, "graph edges untouched");
+});
+
+test("a server that dies immediately degrades instead of crashing the process", async () => {
+  // `true` exits 0 at once, so every write lands on a closed stream — the shape
+  // of a language server that starts and then dies (clangd on a repo it cannot
+  // index). The writes are asynchronous, so their rejections have to be caught
+  // on the promise; unhandled, they terminate the build with ERR_STREAM_DESTROYED
+  // instead of skipping this tier.
+  const client = new LspClient("/usr/bin/true", [], process.cwd(), "cpp");
+  const ok = await client.initialize();
+  assert.equal(ok, false, "a dead server never initializes");
+
+  // Must not throw, and must not leave an unhandled rejection behind.
+  client.didOpen(new URL(import.meta.url).pathname);
+  assert.deepEqual(await client.prepareCallHierarchy(new URL(import.meta.url).pathname, { line: 0, character: 0 }), []);
+  await client.dispose();
+
+  // Give any stray rejection a turn of the loop to surface before we pass.
+  await new Promise((r) => setTimeout(r, 50));
 });

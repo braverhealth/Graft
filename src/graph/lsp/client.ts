@@ -116,7 +116,10 @@ export class LspClient {
       }).then((r) => { clearTimeout(t); resolve(r); }, () => { clearTimeout(t); resolve(null); });
     });
     if (!init) return false;
-    this.conn.sendNotification("initialized", {});
+    // A notification returns a promise; a server that died between the request
+    // and this write rejects it, and an unhandled rejection is fatal to the
+    // process. Swallow it — a dead server is this tier degrading, not a crash.
+    void Promise.resolve(this.conn.sendNotification("initialized", {})).catch(() => {});
     this.ready = true;
     return true;
   }
@@ -129,9 +132,14 @@ export class LspClient {
     try { text = readFileSync(abs, "utf8"); } catch { return; }
     this.opened.add(abs);
     try {
-      this.conn.sendNotification("textDocument/didOpen", {
-        textDocument: { uri: uriOf(abs), languageId: this.languageId, version: 1, text },
-      });
+      // The synchronous try only covers a synchronous throw; the write itself is
+      // asynchronous, so its rejection has to be caught on the promise or it
+      // takes the whole build down as an unhandled rejection.
+      void Promise.resolve(
+        this.conn.sendNotification("textDocument/didOpen", {
+          textDocument: { uri: uriOf(abs), languageId: this.languageId, version: 1, text },
+        }),
+      ).catch(() => { /* stream closed mid-write */ });
     } catch { /* stream closed mid-write */ }
   }
 
