@@ -17,7 +17,7 @@ import { readFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { walkDir } from "../ingest/fs.js";
 import { contextDirFor, ensureGitignored, ensureSearchable } from "../context/node-file.js";
-import { extractFile, languageLabelOf, languageOf, type RawEdge } from "./extract.js";
+import { extractFile, languageLabelOf, languageOf, warmDepthGrammars, type RawEdge } from "./extract.js";
 import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
 import { containerLangOf, extractContainer, warmContainerGrammars } from "./container.js";
 import { contentHash } from "../util/id.js";
@@ -196,6 +196,11 @@ export async function buildGraph(
   // Breadth tier: WASM grammars load asynchronously, so warm the ones this repo
   // needs ONCE here (buildGraph is async) before the synchronous parse loop below
   // can call extractGeneric. Depth-tier (native) grammars need no warmup.
+  // Depth-tier grammars that are WASM (Dart) load asynchronously too, and must
+  // be ready before the synchronous parse loop reaches a file that needs one.
+  await warmDepthGrammars(
+    files.map((f) => languageOf(f.abs)).filter((l): l is NonNullable<typeof l> => !!l),
+  );
   await warmGenericGrammars(
     new Set(files.map((f) => genericLangOf(f.abs)?.name).filter((n): n is string => !!n)),
   );

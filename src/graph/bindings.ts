@@ -43,6 +43,7 @@ const FN_VALUE_TYPES = new Set(["arrow_function", "function", "function_expressi
  * same scope key extract.ts's walk will look it up with), or null if `node`
  * isn't a definition. */
 export function defName(node: Parser.SyntaxNode, lang: Language): string | null {
+  if (lang === "dart") return dartDefName(node);
   if (lang === "java") {
     return JAVA_DEF_TYPES.has(node.type) ? (node.childForFieldName("name")?.text ?? null) : null;
   }
@@ -142,6 +143,7 @@ export function resolveRecvType(
 }
 
 function isClassNode(node: Parser.SyntaxNode, lang: Language): boolean {
+  if (lang === "dart") return DART_TYPE_DECLS.has(node.type);
   if (lang === "python") return node.type === "class_definition";
   if (lang === "java") return JAVA_TYPE_DECLS.has(node.type);
   if (lang === "typescript" || lang === "tsx") {
@@ -214,6 +216,7 @@ function visit(
   else if (lang === "go") handleGo(node, scope, bindings);
   else if (lang === "java") handleJava(node, scope, classScope, bindings);
   else if (lang === "php") handlePhp(node, scope, bindings);
+  else if (lang === "dart") handleDart(node, scope, classScope, bindings);
   else handleTs(node, scope, classScope, bindings, aliases);
 
   const name = defName(node, lang);
@@ -224,6 +227,121 @@ function visit(
     if (isClassNode(node, lang)) childClassScope = childScope.join(".");
   }
   for (const child of node.namedChildren) visit(child, lang, childScope, childClassScope, bindings, aliases);
+  // Dart keeps a function's body beside its signature rather than inside it, so
+  // the body has to be visited under the signature's scope — otherwise every
+  // local binds at class scope and two methods sharing a variable name would
+  // each see the other's type.
+  if (lang === "dart" && name !== null) {
+    const body = dartBodyOf(node);
+    if (body) {
+      for (const child of body.namedChildren) visit(child, lang, childScope, childClassScope, bindings, aliases);
+    }
+  }
+}
+
+/** Dart type declarations that open a class scope. */
+const DART_TYPE_DECLS: ReadonlySet<string> = new Set([
+  "class_definition",
+  "mixin_declaration",
+  "extension_declaration",
+  "enum_declaration",
+]);
+
+/** The `function_body` that follows a Dart signature, if any. */
+function dartBodyOf(node: Parser.SyntaxNode): Parser.SyntaxNode | null {
+  if (!node.type.endsWith("_signature") && node.type !== "method_signature") return null;
+  const next = node.nextNamedSibling;
+  return next && next.type === "function_body" ? next : null;
+}
+
+/** Scope segment for a Dart definition — must match describeDart in extract.ts,
+ * or a lookup from the walk will miss what was bound here. */
+function dartDefName(node: Parser.SyntaxNode): string | null {
+  if (node.type === "method_signature") return null; // wrapper; its child names it
+  if (node.type === "mixin_declaration") {
+    return node.namedChildren.find((c) => c.type === "identifier")?.text ?? null;
+  }
+  if (node.type === "constructor_signature") {
+    const names = node.namedChildren.filter((c) => c.type === "identifier");
+    if (!names.length) return null;
+    return names.length > 1 ? `${names[0].text}.${names[names.length - 1].text}` : names[0].text;
+  }
+  if (
+    DART_TYPE_DECLS.has(node.type) ||
+    node.type === "function_signature" ||
+    node.type === "getter_signature" ||
+    node.type === "setter_signature"
+  ) {
+    return node.childForFieldName("name")?.text ?? null;
+  }
+  return null;
+}
+
+/**
+ * Dart receiver typing: what type is each variable, parameter and field?
+ *
+ * A declared type always wins over an inferred one — `Base b = Widget()` makes
+ * `b.doThing()` a call on Base, which is what the analyser would say too. Only
+ * when there is no annotation does the initialiser decide, and then only for the
+ * unambiguous shape `final x = SomeType(...)`.
+ */
+function handleDart(
+  node: Parser.SyntaxNode,
+  scope: string[],
+  classScope: string | null,
+  bindings: FileBindings,
+): void {
+  const scopePath = scope.join(".");
+
+  // `this` inside a type body.
+  if (DART_TYPE_DECLS.has(node.type) && classScope) {
+    const name = dartDefName(node);
+    if (name) bindings.set([...scope, name].join("."), "this", name);
+  }
+
+  // `String s` / `final Foo foo` / `Foo foo = ...` — a declared type on a
+  // parameter or a local.
+  if (node.type === "formal_parameter" || node.type === "initialized_variable_definition") {
+    const type = node.namedChildren.find((c) => c.type === "type_identifier")?.text;
+    const name =
+      node.childForFieldName("name")?.text ??
+      node.namedChildren.find((c) => c.type === "identifier")?.text;
+    if (name) {
+      if (type) {
+        bindings.set(scopePath, name, type);
+      } else if (node.type === "initialized_variable_definition") {
+        // `final w = Widget('x')`: the value is an identifier immediately
+        // followed by an argument list, which in Dart is a constructor call.
+        const values = node.namedChildren.filter((c) => c !== node.childForFieldName("name"));
+        for (let i = 0; i < values.length - 1; i++) {
+          const v = values[i];
+          const next = values[i + 1];
+          if (
+            v.type === "identifier" &&
+            next.type === "selector" &&
+            next.namedChildren.some((c) => c.type === "argument_part") &&
+            /^[A-Z_]/.test(v.text)
+          ) {
+            bindings.set(scopePath, name, v.text);
+            break;
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  // A class field: `final String name;` inside a class body.
+  if (node.type === "declaration" && classScope) {
+    const type = node.namedChildren.find((c) => c.type === "type_identifier")?.text;
+    if (!type) return;
+    for (const list of node.namedChildren.filter((c) => c.type === "initialized_identifier_list")) {
+      for (const ii of list.namedChildren.filter((c) => c.type === "initialized_identifier")) {
+        const name = ii.namedChildren.find((c) => c.type === "identifier")?.text;
+        if (name) bindings.set(classScope, name, type);
+      }
+    }
+  }
 }
 
 /** Resolves a bare type name through `aliases` — every annotation path must

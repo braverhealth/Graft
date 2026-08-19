@@ -17,7 +17,7 @@ import { contentHash } from "../util/id.js";
 import { collectBindings, goReceiverVarOf, resolveRecvType, type FileBindings } from "./bindings.js";
 import type { Kind, NodeV1, Relation } from "./types.js";
 
-export type Language = "typescript" | "tsx" | "python" | "go" | "java" | "php";
+export type Language = "typescript" | "tsx" | "python" | "go" | "java" | "php" | "dart";
 
 /**
  * Extension → the tree-sitter grammar that parses it, and the label a human expects
@@ -48,6 +48,7 @@ const EXTENSIONS: ReadonlyArray<{ ext: string; grammar: Language; label: string 
   { ext: ".go", grammar: "go", label: "go" },
   { ext: ".java", grammar: "java", label: "java" },
   { ext: ".php", grammar: "php", label: "php" },
+  { ext: ".dart", grammar: "dart", label: "dart" },
 ];
 
 function entryFor(path: string): (typeof EXTENSIONS)[number] | undefined {
@@ -194,6 +195,30 @@ const PHP_KINDS: Record<string, Kind> = {
 };
 
 
+/**
+ * Dart definition node types. The callables are all `*_signature`, and each
+ * one's body is its NEXT SIBLING rather than a child — the shape `walk` has to
+ * be told about, since it otherwise descends only into children and would
+ * attribute every call in a body to the enclosing class.
+ */
+const DART_KINDS: Record<string, Kind> = {
+  class_definition: "class",
+  mixin_declaration: "interface",
+  extension_declaration: "class",
+  enum_declaration: "enum",
+  type_alias: "type",
+  enum_constant: "constant",
+  function_signature: "function",
+  method_signature: "method",
+  constructor_signature: "method",
+  getter_signature: "method",
+  setter_signature: "method",
+  // Fields and top-level constants. Dart hangs both off a list node, so the
+  // describe below reads the name out of the child rather than a `name:` field.
+  initialized_identifier: "variable",
+  static_final_declaration: "constant",
+};
+
 const KINDS_BY_LANG: Record<Language, Record<string, Kind>> = {
   typescript: TS_KINDS,
   tsx: TS_KINDS,
@@ -201,6 +226,7 @@ const KINDS_BY_LANG: Record<Language, Record<string, Kind>> = {
   go: GO_KINDS,
   java: JAVA_KINDS,
   php: PHP_KINDS,
+  dart: DART_KINDS,
 };
 
 /**
@@ -224,6 +250,10 @@ const CALL_TYPES: Record<Language, ReadonlySet<string>> = {
     "nullsafe_member_call_expression",
     "scoped_call_expression",
   ]),
+  // Dart's grammar has no call node at all. A call is an identifier followed by
+  // a sibling `selector` holding an `argument_part`, so the selector is the site
+  // and the callee is read backwards from it (see dartCallee).
+  dart: new Set(["selector"]),
 };
 
 const FUNCTION_VALUE_TYPES = new Set([
@@ -234,6 +264,42 @@ const FUNCTION_VALUE_TYPES = new Set([
 ]);
 
 const parser = new Parser();
+
+/**
+ * Depth-tier languages whose grammar is WASM rather than a native binding.
+ *
+ * The tier's walker only ever touches `.type`, `.text`, `.namedChildren`,
+ * `.childForFieldName`, `.parent`, and the index/position pairs — all of which
+ * web-tree-sitter provides with the same shape as the native binding. So the
+ * backend only changes how a file is parsed, not how it is read, and a language
+ * can have receiver typing here without shipping a node-gyp build to every
+ * machine that installs graft. `tree-sitter-dart` has no prebuilt binaries,
+ * which is what made this necessary.
+ */
+const WASM_GRAMMARS: Partial<Record<Language, string>> = { dart: "dart" };
+const wasmLoaded = new Map<Language, unknown>();
+let wasmParser: { setLanguage(l: unknown): void; parse(cb: (i: number) => string): { rootNode: Parser.SyntaxNode; delete(): void } | null } | null = null;
+
+/** Load the WASM grammars for any of `langs` that need one. Must be awaited
+ * once before `extractFile` runs in a synchronous loop, exactly as the breadth
+ * tier's `warmGenericGrammars` is. */
+export async function warmDepthGrammars(langs: Iterable<Language>): Promise<void> {
+  const need = [...new Set(langs)].filter((l) => WASM_GRAMMARS[l] && !wasmLoaded.has(l));
+  if (!need.length) return;
+  const { loadWasmLanguage, newWasmParser } = await import("./generic.js");
+  for (const lang of need) {
+    const language = await loadWasmLanguage(WASM_GRAMMARS[lang]!);
+    if (language) wasmLoaded.set(lang, language);
+  }
+  if (wasmLoaded.size && !wasmParser) wasmParser = (await newWasmParser()) as typeof wasmParser;
+}
+
+/** True when this language is parseable right now — a WASM grammar that failed
+ * to load leaves its files to the breadth tier rather than throwing. */
+export function isDepthReady(lang: Language): boolean {
+  return WASM_GRAMMARS[lang] ? wasmLoaded.has(lang) && wasmParser !== null : true;
+}
+
 const GRAMMARS: Record<Language, unknown> = {
   typescript: TypeScript.typescript,
   tsx: TypeScript.tsx,
@@ -241,6 +307,7 @@ const GRAMMARS: Record<Language, unknown> = {
   go: Go,
   java: Java,
   php: PHP.php,
+  dart: null, // WASM; see WASM_GRAMMARS
 };
 
 export interface WalkCtx {
@@ -264,6 +331,10 @@ interface DefDescriptor {
   kind: Kind;
   headerEnd: number; // char index where the signature ends (body starts)
   hashNode: Parser.SyntaxNode; // node whose text forms body_hash / span
+  /** Where the definition really ends, when that is not `hashNode`. Dart keeps a
+   * function's body in the sibling after its signature, so span, body_hash and
+   * body_text all have to reach past `hashNode` to cover the pair. */
+  endNode?: Parser.SyntaxNode;
   arity?: number; // declared parameter count — overload disambiguation (Java)
   variadic?: boolean; // last parameter is a vararg, so `arity` is a minimum
 }
@@ -279,8 +350,21 @@ function parseSource(source: string): Parser.SyntaxNode {
 }
 
 export function extractFile(rel: string, source: string, lang: Language): ExtractResult {
-  parser.setLanguage(GRAMMARS[lang] as never);
-  const root = parseSource(source);
+  // A WASM tree owns memory that only an explicit delete() releases, so it is
+  // freed once everything below has read what it needs. Nothing returned from
+  // here points into the tree: every field is a string or number copied out.
+  let wasmTree: { rootNode: Parser.SyntaxNode; delete(): void } | null = null;
+  let root: Parser.SyntaxNode;
+  if (WASM_GRAMMARS[lang]) {
+    wasmParser!.setLanguage(wasmLoaded.get(lang));
+    wasmTree = wasmParser!.parse((index: number) => source.slice(index, index + PARSE_CHUNK));
+    if (!wasmTree) return { nodes: [fileNodeFor(rel, source)], rawEdges: [] };
+    root = wasmTree.rootNode;
+  } else {
+    parser.setLanguage(GRAMMARS[lang] as never);
+    root = parseSource(source);
+  }
+  try {
   const bindings = collectBindings(root, lang);
   const importedSymbols = collectImportedSymbols(root, lang);
 
@@ -327,6 +411,36 @@ export function extractFile(rel: string, source: string, lang: Language): Extrac
   // residual on the file node so a term outside every symbol still surfaces it.
   nodes[0].body_text = fileResidual(source, nodes.slice(1));
   return { nodes, rawEdges };
+  } finally {
+    wasmTree?.delete();
+  }
+}
+
+/** A definition's full text: `hashNode` alone, or through `endNode` when the
+ * body is a sibling rather than a child. */
+function defText(desc: DefDescriptor, ctx: WalkCtx): string {
+  return desc.endNode
+    ? ctx.source.slice(desc.hashNode.startIndex, desc.endNode.endIndex)
+    : desc.hashNode.text;
+}
+
+/** The bare file node, for the paths that give up before walking anything. */
+function fileNodeFor(rel: string, source: string): NodeV1 {
+  return {
+    id: rel,
+    name: basename(rel),
+    kind: "file",
+    path: rel,
+    span: `L1-L${Math.max(1, source.split("\n").length)}`,
+    signature: null,
+    exported: true,
+    origin: "ast",
+    body_hash: contentHash(source),
+    chars: source.length,
+    summary_state: "pending",
+    summary: null,
+    crux: null,
+  };
 }
 
 /** Mint-time uniqueness: a document-order duplicate (same name reopened, or two
@@ -364,7 +478,7 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
       name: desc.name,
       kind: desc.kind,
       path: ctx.rel,
-      span: `L${desc.hashNode.startPosition.row + 1}-L${desc.hashNode.endPosition.row + 1}`,
+      span: `L${desc.hashNode.startPosition.row + 1}-L${(desc.endNode ?? desc.hashNode).endPosition.row + 1}`,
       signature: clean(ctx.source.slice(desc.hashNode.startIndex, desc.headerEnd)),
       exported:
         ctx.lang === "python"
@@ -377,8 +491,8 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
                 ? phpExported(node)
                 : tsExported(node),
       origin: "ast",
-      body_hash: contentHash(desc.hashNode.text),
-      body_text: searchBody(desc.hashNode.text),
+      body_hash: contentHash(defText(desc, ctx)),
+      body_text: searchBody(defText(desc, ctx)),
       summary_state: "pending",
       summary: null,
       crux: null,
@@ -412,13 +526,22 @@ function walk(node: Parser.SyntaxNode, ctx: WalkCtx, out: NodeV1[], edges: RawEd
           : ctx.importedSymbols,
     };
     for (const child of node.namedChildren) walk(child, childCtx, out, edges, minted);
+    // Dart only: the body is the sibling after the signature, so it has to be
+    // walked here under this definition. The enclosing block will reach it too,
+    // which is what `dartBodyIsAttached` below suppresses.
+    if (desc.endNode) {
+      for (const child of desc.endNode.namedChildren) walk(child, childCtx, out, edges, minted);
+    }
     return;
   }
+
+  // A Dart body already walked as part of the signature before it.
+  if (ctx.lang === "dart" && dartBodyIsAttached(node)) return;
 
   // not a definition — capture calls/imports/references, then descend with the same context
   const callTypes = CALL_TYPES[ctx.lang];
   if (callTypes.has(node.type)) {
-    const callee = calleeName(node, ctx.lang);
+    const callee = ctx.lang === "dart" ? dartCallee(node) : calleeName(node, ctx.lang);
     if (callee) {
       const callEdge: RawEdge = {
         source: ctx.parentId,
@@ -593,6 +716,7 @@ function isDeclarationName(node: Parser.SyntaxNode): boolean {
 function describe(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | null {
   if (ctx.lang === "go") return describeGo(node, ctx);
   if (ctx.lang === "java") return describeJava(node, ctx);
+  if (ctx.lang === "dart") return describeDart(node, ctx);
 
   // PHP closures: `$h = function () {…}` / `fn() => …`, and bare callbacks
   // (`$routes->get('/x', function () {…})`). Captured as function nodes so a
@@ -634,6 +758,114 @@ function describe(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | null {
         hashNode: node,
       };
     }
+  }
+  return null;
+}
+
+/**
+ * The body that belongs to a Dart signature: its next named sibling, when that
+ * is a `function_body`. Dart's grammar keeps the two apart, so a definition's
+ * text, its span, and the calls inside it all have to be assembled from the
+ * pair rather than read off one node.
+ */
+function dartBodyOf(node: Parser.SyntaxNode): Parser.SyntaxNode | null {
+  const next = node.nextNamedSibling;
+  return next && next.type === "function_body" ? next : null;
+}
+
+/** A `function_body` already consumed by the signature before it — walking it
+ * again from the enclosing class would duplicate every call it contains. */
+function dartBodyIsAttached(node: Parser.SyntaxNode): boolean {
+  if (node.type !== "function_body") return false;
+  const prev = node.previousNamedSibling;
+  return !!prev && (prev.type in DART_KINDS) && prev.type.endsWith("_signature");
+}
+
+/** Dart definition shapes. Only `class_definition`, `enum_declaration` and
+ * `extension_declaration` carry a `name:` field; a mixin names itself with a
+ * bare identifier child, a typedef with a type_identifier, and a member
+ * signature hides its name one level down inside `method_signature`. */
+function describeDart(node: Parser.SyntaxNode, ctx: WalkCtx): DefDescriptor | null {
+  const kind = DART_KINDS[node.type];
+  if (!kind) return null;
+
+  // `method_signature` is a wrapper: the real shape (function/getter/setter) is
+  // its only named child, and describing both would mint the member twice.
+  if (node.type === "method_signature") return null;
+
+  let name: string | undefined;
+  if (node.type === "initialized_identifier" || node.type === "static_final_declaration") {
+    // A local inside a function body is not a symbol anyone looks up; only the
+    // ones declared on a type or at the top level are.
+    const inBody = ancestorIsFunctionBody(node);
+    if (inBody) return null;
+    const ident = node.namedChildren.find((c) => c.type === "identifier");
+    if (!ident) return null;
+    return { name: ident.text, kind, headerEnd: node.endIndex, hashNode: node };
+  }
+  if (node.type === "mixin_declaration") {
+    name = node.namedChildren.find((c) => c.type === "identifier")?.text;
+  } else if (node.type === "type_alias") {
+    name = node.namedChildren.find((c) => c.type === "type_identifier")?.text;
+  } else if (node.type === "constructor_signature") {
+    // `Widget.named(...)` carries two name fields; the last is the one that
+    // distinguishes it from the unnamed constructor.
+    const names = node.namedChildren.filter((c) => c.type === "identifier");
+    name = names.length > 1 ? `${names[0].text}.${names[names.length - 1].text}` : names[0]?.text;
+  } else {
+    name = node.childForFieldName("name")?.text;
+  }
+  if (!name) return null;
+
+  // A member's signature sits inside `method_signature`; the pair to hash and
+  // span is that wrapper plus the body after it.
+  const outer = node.parent?.type === "method_signature" ? node.parent : node;
+  const body = dartBodyOf(outer);
+  // An abstract member is wrapped in `declaration` rather than sitting directly
+  // in the class body, so both shapes have to count as membership or `void
+  // doThing();` lands as a free function.
+  const holder = outer.parent?.type === "declaration" ? outer.parent.parent : outer.parent;
+  const isMember = holder?.type === "class_body" || holder?.type === "extension_body";
+  return {
+    name,
+    kind: kind === "function" && isMember ? "method" : kind,
+    headerEnd: outer.endIndex,
+    hashNode: outer,
+    endNode: body ?? undefined,
+  };
+}
+
+/**
+ * The callee at a Dart call site. The `selector` holding the `argument_part` is
+ * the site; what is being called is read backwards from it — either a bare
+ * identifier (`compute()`, `Widget()`) or a preceding `.name` selector
+ * (`w.doThing()`), in which case the receiver is the identifier before that.
+ */
+/** Whether this node sits inside a function body — used to keep locals out of
+ * the graph while still minting fields and top-level declarations. */
+function ancestorIsFunctionBody(node: Parser.SyntaxNode): boolean {
+  for (let p = node.parent; p; p = p.parent) {
+    if (p.type === "function_body") return true;
+    if (p.type === "class_body" || p.type === "program" || p.type === "extension_body") return false;
+  }
+  return false;
+}
+
+function dartCallee(node: Parser.SyntaxNode): { name: string; viaMember?: boolean; receiver?: string } | null {
+  if (!node.namedChildren.some((c) => c.type === "argument_part")) return null;
+  const prev = node.previousNamedSibling;
+  if (!prev) return null;
+  if (prev.type === "identifier") return { name: prev.text };
+  if (prev.type === "selector") {
+    const member = prev.namedChildren.find((c) => c.type === "unconditional_assignable_selector");
+    const name = member?.namedChildren.find((c) => c.type === "identifier")?.text;
+    if (!name) return null;
+    const recv = prev.previousNamedSibling;
+    return {
+      name,
+      viaMember: true,
+      receiver: recv && (recv.type === "identifier" || recv.type === "this") ? recv.text : undefined,
+    };
   }
   return null;
 }
@@ -767,6 +999,29 @@ function phpClosureName(node: Parser.SyntaxNode): string {
 
 function heritageEdges(node: Parser.SyntaxNode, classId: string, ctx: WalkCtx): RawEdge[] {
   const edges: RawEdge[] = [];
+  if (ctx.lang === "dart") {
+    // `class W extends B with M implements I` splits three ways, and `with`
+    // nests INSIDE the superclass node rather than sitting beside it. An
+    // extension's `on` clause names the type it extends, which is the same
+    // relationship from the graph's point of view.
+    for (const child of node.namedChildren) {
+      if (child.type === "superclass") {
+        for (const t of child.namedChildren) {
+          if (t.type === "type_identifier") edges.push({ source: classId, relation: "extends", name: t.text, file: ctx.rel });
+          if (t.type === "mixins") {
+            for (const m of typeIdentifiersIn(t)) edges.push({ source: classId, relation: "implements", name: m, file: ctx.rel });
+          }
+        }
+      } else if (child.type === "interfaces") {
+        for (const t of typeIdentifiersIn(child)) {
+          edges.push({ source: classId, relation: "implements", name: t, file: ctx.rel });
+        }
+      } else if (child.type === "type_identifier" && node.type === "extension_declaration") {
+        edges.push({ source: classId, relation: "extends", name: child.text, file: ctx.rel });
+      }
+    }
+    return edges;
+  }
   if (ctx.lang === "java") {
     // `superclass` holds `extends X`; `super_interfaces` holds `implements A, B`
     // (and, on an interface declaration, `extends A, B` — which tree-sitter-java

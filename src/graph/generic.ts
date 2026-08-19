@@ -57,7 +57,6 @@ export const GENERIC_LANGS: readonly GenericLang[] = [
   { name: "solidity", exts: [".sol"], wasm: "solidity" },
   { name: "ocaml", exts: [".ml", ".mli"], wasm: "ocaml" },
   { name: "zig", exts: [".zig"], wasm: "zig" },
-  { name: "dart", exts: [".dart"], wasm: "dart" }, // surfaced by PR #38 (@muneebshere)
   { name: "clojure", exts: [".clj", ".cljs", ".cljc", ".bb"], wasm: "clojure" },
 ];
 
@@ -174,6 +173,15 @@ export async function loadWasmLanguage(wasm: string): Promise<unknown | null> {
   } catch {
     return null;
   }
+}
+
+/** A fresh web-tree-sitter Parser, for callers outside this module that drive
+ * their own parse (the depth tier's WASM path). Returns null before
+ * `loadWasmLanguage` has initialised the runtime. */
+export async function newWasmParser(): Promise<unknown | null> {
+  if (!tsMod) return null;
+  await initPromise;
+  return new tsMod.Parser();
 }
 
 const PARSE_CHUNK = 16384; // <32KB slices — same tree-sitter limit workaround as extract.ts
