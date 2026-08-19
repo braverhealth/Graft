@@ -425,6 +425,7 @@ export async function buildGraph(
     const { enrichWithLsp } = await import("./lsp/enrich.js");
     const { readLspEdgeCache, writeLspEdgeCache, emptyLspEdgeCache } =
       await import("./lsp/edge-cache.js");
+    type LspFileEntry = { hash: string; edges: EdgeV1[] };
     const { pickServers } = await import("./lsp/registry.js");
     const { genericLangOf: gl } = await import("./generic.js");
 
@@ -453,13 +454,16 @@ export async function buildGraph(
     // Replay the edges of every file that didn't move. An edge is dropped when
     // either end no longer exists, because a *different* file changing can
     // delete the node this one pointed at.
-    const carried: Record<string, EdgeV1[]> = {};
-    for (const [rel, edges] of Object.entries(prior.files)) {
+    const carried: Record<string, LspFileEntry> = {};
+    for (const [rel, held] of Object.entries(prior.files)) {
       if (reparsed.has(rel) || !sources.has(rel)) continue; // changed, or gone from the repo
-      const live = edges.filter(
+      // The hash is the entry's warrant: unchanged bytes mean the server would
+      // answer the same way, whatever version of graft asked last time.
+      if (held.hash !== entries[rel]?.hash) continue;
+      const live = held.edges.filter(
         (e) => nodeIds.has(e.source) && nodeIds.has(e.target),
       );
-      carried[rel] = live;
+      carried[rel] = { hash: held.hash, edges: live };
       for (const e of live) {
         const key = `${e.source}\0${e.relation}\0${e.target}`;
         if (seen.has(key)) continue;
@@ -499,10 +503,13 @@ export async function buildGraph(
         if (held) next.files[rel] = held;
       }
     }
-    for (const rel of r.queriedFiles) next.files[rel] = [];
+    for (const rel of r.queriedFiles) {
+      next.files[rel] = { hash: entries[rel]?.hash ?? "", edges: [] };
+    }
     for (const e of r.addedEdges) {
       const rel = byIdPath.get(e.source);
-      if (rel) (next.files[rel] ??= []).push(e);
+      if (!rel) continue;
+      (next.files[rel] ??= { hash: entries[rel]?.hash ?? "", edges: [] }).edges.push(e);
     }
     writeLspEdgeCache(outDir, next);
 

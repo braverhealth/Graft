@@ -44,12 +44,23 @@ export const LSP_CACHE_PREFIX = "lsp";
 
 export interface LspEdgeCache {
   version: number;
-  /** Identity of the extractor that produced the nodes these edges point at. */
+  /** Identity of the extractor that produced the nodes these edges point at.
+   * Recorded for diagnosis only — it deliberately does NOT invalidate the memo,
+   * because an edge describes a relationship in the SOURCE. See readLspEdgeCache. */
   extractor: string;
   /** Which servers produced these edges; a different set invalidates the memo. */
   servers: string;
-  /** repo-relative path of an edge's SOURCE file → the edges rooted in it. */
-  files: Record<string, EdgeV1[]>;
+  /** repo-relative path of an edge's SOURCE file → its content hash at the time
+   * the server answered, and the edges rooted in it. The hash is what makes the
+   * entry verifiable: if the file's bytes are unchanged, the server would say
+   * the same thing again. */
+  files: Record<string, LspFileEntry>;
+}
+
+export interface LspFileEntry {
+  /** sha256 of the source file when these edges were derived. */
+  hash: string;
+  edges: EdgeV1[];
 }
 
 export function emptyLspEdgeCache(servers = ""): LspEdgeCache {
@@ -69,7 +80,13 @@ export function readLspEdgeCache(outDir: string, servers: string): LspEdgeCache 
   if (!path) return emptyLspEdgeCache(servers);
   const raw = readJson<LspEdgeCache>(path);
   if (!raw || raw.version !== CACHE_VERSION) return emptyLspEdgeCache(servers);
-  if (raw.extractor !== (extractorStamp() ?? "")) return emptyLspEdgeCache(servers);
+  // NOT invalidated by a change of extractor. An LSP edge states that one span
+  // of source calls another, which upgrading graft does not alter; what would
+  // alter it is the file changing, and every entry carries the hash that catches
+  // that. Keying on the extractor instead meant every version bump threw away
+  // the whole memo and paid the full pass again — on a large repo, minutes per
+  // upgrade, which is the cost a team actually feels. Endpoints that no longer
+  // exist are pruned when the entry is replayed.
   // A server that stopped being installed would otherwise leave its edges in the
   // graph forever, with nothing left to re-derive or correct them.
   if (raw.servers !== servers) return emptyLspEdgeCache(servers);

@@ -11,7 +11,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { buildGraph } from "../src/graph/build.js";
@@ -23,6 +23,12 @@ import {
   writeLspEdgeCache,
 } from "../src/graph/lsp/edge-cache.js";
 import type { EdgeV1 } from "../src/graph/types.js";
+import { createHash } from "node:crypto";
+
+/** The same hash the extraction memo records for a file. */
+function hashOf(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
 
 const SRC = `export function alpha(): number {
   return 1;
@@ -48,12 +54,19 @@ test("memo round-trips, and its identity invalidates it", () => {
     assert.ok(lspCachePath(out), "a stamped path exists");
 
     const cache = emptyLspEdgeCache("dart");
-    cache.files["src/a.ts"] = [
-      { source: "src/a.ts#beta", target: "src/a.ts#alpha", relation: "calls", confidence: "lsp_resolved" } as EdgeV1,
-    ];
+    cache.files["src/a.ts"] = {
+      hash: "deadbeef",
+      edges: [
+        { source: "src/a.ts#beta", target: "src/a.ts#alpha", relation: "calls", confidence: "lsp_resolved" } as EdgeV1,
+      ],
+    };
     writeLspEdgeCache(out, cache);
 
     assert.deepEqual(readLspEdgeCache(out, "dart").files["src/a.ts"], cache.files["src/a.ts"]);
+    // An extractor change must NOT throw the memo away: the edges describe the
+    // source, and each entry's hash is what proves it still applies.
+    const kept = readLspEdgeCache(out, "dart");
+    assert.equal(kept.files["src/a.ts"].edges.length, 1, "survives an extractor bump");
     // A different set of servers must not reuse the previous set's edges — a
     // server that stopped being installed would otherwise be frozen into the
     // graph with nothing left to correct it.
@@ -79,12 +92,15 @@ test("an unchanged file replays its edges instead of re-querying", async () => {
     // not the reverse), so a carried copy can't be confused with a real edge the
     // extractor would have produced anyway.
     const seeded = emptyLspEdgeCache("");
-    seeded.files["src/a.ts"] = [
+    seeded.files["src/a.ts"] = {
+      hash: hashOf(join(dir, "src", "a.ts")),
+      edges: [
       { source: alpha, target: beta, relation: "calls", confidence: "lsp_resolved" } as EdgeV1,
       // A dangling edge: its target is not a node in this graph, so carrying it
       // forward would corrupt the graph with a reference to nothing.
       { source: alpha, target: "src/gone.ts#vanished", relation: "calls", confidence: "lsp_resolved" } as EdgeV1,
-    ];
+      ],
+    };
     writeLspEdgeCache(out, seeded);
 
     // Nothing changed on disk, so every file replays and no server is consulted.
@@ -110,9 +126,12 @@ test("a cold build ignores the memo entirely", async () => {
     const alpha = before.nodes.find((n) => n.id.endsWith("#alpha"))!.id;
 
     const seeded = emptyLspEdgeCache("");
-    seeded.files["src/a.ts"] = [
+    seeded.files["src/a.ts"] = {
+      hash: hashOf(join(dir, "src", "a.ts")),
+      edges: [
       { source: alpha, target: beta, relation: "calls", confidence: "lsp_resolved" } as EdgeV1,
-    ];
+      ],
+    };
     writeLspEdgeCache(out, seeded);
 
     // `--no-reuse` means "re-derive everything"; a memo that survived it would
@@ -135,9 +154,12 @@ test("replay-only keeps memoized edges and never consults a server", async () =>
     const beta = before.nodes.find((n) => n.id.endsWith("#beta"))!.id;
 
     const seeded = emptyLspEdgeCache("");
-    seeded.files["src/a.ts"] = [
+    seeded.files["src/a.ts"] = {
+      hash: hashOf(join(dir, "src", "a.ts")),
+      edges: [
       { source: alpha, target: beta, relation: "calls", confidence: "lsp_resolved" } as EdgeV1,
-    ];
+      ],
+    };
     writeLspEdgeCache(out, seeded);
 
     // Change the file, so a querying build would have to re-derive its edges.
@@ -150,7 +172,7 @@ test("replay-only keeps memoized edges and never consults a server", async () =>
     // graph — but it is also not erased from the memo, because nothing
     // re-derived it. The next explicit --lsp build is what replaces it.
     assert.ok(after.nodes.some((n) => n.id.endsWith("#gamma")), "the new definition is indexed");
-    assert.deepEqual(readLspEdgeCache(out, "").files["src/a.ts"], seeded.files["src/a.ts"]);
+    assert.deepEqual(readLspEdgeCache(out, "").files["src/a.ts"].edges, seeded.files["src/a.ts"].edges);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -168,9 +190,12 @@ test("replay-only replays an unchanged file's edges", async () => {
     const beta = before.nodes.find((n) => n.id.endsWith("#beta"))!.id;
 
     const seeded = emptyLspEdgeCache("");
-    seeded.files["src/a.ts"] = [
+    seeded.files["src/a.ts"] = {
+      hash: hashOf(join(dir, "src", "a.ts")),
+      edges: [
       { source: alpha, target: beta, relation: "calls", confidence: "lsp_resolved" } as EdgeV1,
-    ];
+      ],
+    };
     writeLspEdgeCache(out, seeded);
 
     // Touch a DIFFERENT file: a.ts is unchanged, so its edges must survive.
