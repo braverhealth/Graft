@@ -18,6 +18,16 @@ test("pickServer: a language no registered server covers → null", () => {
   assert.equal(pickServer(new Set(["cobol", "fortran"])), null);
 });
 
+test("dart is served by the Dart SDK's own analysis server", () => {
+  const dart = LSP_SERVERS.find((s) => s.languages.includes("dart"));
+  assert.ok(dart, "a registry row covers dart");
+  // `dart language-server` speaks LSP by default, but the flag is explicit so a
+  // future SDK default can't silently switch it to the legacy analyzer protocol.
+  assert.equal(dart!.command, "dart");
+  assert.deepEqual(dart!.args, ["language-server", "--protocol=lsp"]);
+  assert.equal(dart!.languageId, "dart");
+});
+
 test("registry rows are well-formed (languages, command, languageId)", () => {
   for (const s of LSP_SERVERS) {
     assert.ok(s.languages.length > 0 && s.command && s.languageId, `${s.command} row shape`);
