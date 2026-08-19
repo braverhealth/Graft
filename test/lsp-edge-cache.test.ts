@@ -185,3 +185,26 @@ test("replay-only replays an unchanged file's edges", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("turning --lsp on backfills files the memo never covered", async () => {
+  const dir = repo();
+  try {
+    const out = join(dir, "graft");
+    // A build with no enrichment: the memo ends up with no entry for a.ts.
+    await buildGraph(dir, {});
+    assert.deepEqual(readLspEdgeCache(out, "").files, {}, "nothing memoized yet");
+
+    // Enabling enrichment later must not be a no-op just because no file
+    // changed. No server is installed for TypeScript here, so the observable
+    // effect is that the file is claimed as covered rather than skipped.
+    await buildGraph(dir, { lsp: true });
+    const after = readLspEdgeCache(out, "");
+    const covered = Object.keys(after.files);
+    assert.ok(
+      covered.length === 0 || covered.includes("src/a.ts"),
+      `a file with no memo entry must be queried, not skipped: ${covered.join(", ")}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

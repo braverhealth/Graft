@@ -367,9 +367,17 @@ export async function buildGraph(
       }
     }
 
-    // Ask the servers about the rest. On a cold build that is every file, which
-    // is exactly today's behaviour. Under replay-only nothing is asked at all.
-    const onlyFiles = cold ? undefined : reparsed;
+    // Ask the servers about the rest: the files that changed, plus any the memo
+    // has never covered. That second half is what makes enabling `--lsp` on a
+    // repo that was built without it actually backfill — keyed on changed files
+    // alone, a build after the flag was turned on queries nothing, because
+    // nothing changed, and the edges never appear.
+    const onlyFiles = cold
+      ? undefined
+      : new Set([
+          ...reparsed,
+          ...[...sources.keys()].filter((rel) => !(rel in prior.files)),
+        ]);
     const r = opts.lspReplayOnly
       ? { added: 0, queried: 0, server: null, addedEdges: [] as EdgeV1[], queriedFiles: new Set<string>() }
       : await enrichWithLsp(graph, root, { onlyFiles });
