@@ -117,6 +117,56 @@ function windowFor(nodes: NodeRef[]): { from: number; to: number } {
   return { from: Number.isFinite(from) ? from : 1, to };
 }
 
+/** Rendered length of each numbered line, as a prefix sum for O(1) windows. */
+function lineCostPrefix(source: string): number[] {
+  const lines = source.split("\n");
+  const prefix = new Array<number>(lines.length + 1);
+  prefix[0] = 0;
+  for (let i = 1; i <= lines.length; i++) {
+    prefix[i] = prefix[i - 1] + `${i}\t${lines[i - 1] ?? ""}\n`.length;
+  }
+  return prefix;
+}
+
+/**
+ * Group targets into calls whose source window actually fits the budget.
+ *
+ * Capping a batch by target count alone is not enough: twenty large definitions
+ * can span more source than one request may carry, and the surplus is then cut
+ * from the text while still being asked about — the model answers for code it
+ * cannot see. Batching on both counts keeps every target visible in its own
+ * request. A single definition bigger than the whole budget still gets clipped,
+ * but it travels alone, so it is the only symbol its truncation can affect.
+ */
+function batchTargets(nodes: NodeRef[], source: string): NodeRef[][] {
+  const prefix = lineCostPrefix(source);
+  const lastLine = prefix.length - 1;
+  const charsFor = (batch: NodeRef[]): number => {
+    const { from, to } = windowFor(batch);
+    const start = Math.max(1, Math.min(from, lastLine));
+    const end = Math.min(lastLine, Math.max(to, start));
+    return prefix[end] - prefix[start - 1];
+  };
+  const ordered = [...nodes].sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
+  const batches: NodeRef[][] = [];
+  let current: NodeRef[] = [];
+  for (const node of ordered) {
+    if (current.length === 0) {
+      current = [node];
+      continue;
+    }
+    const grown = [...current, node];
+    if (grown.length > MAX_TARGETS_PER_CALL || charsFor(grown) > MAX_CODE_CHARS) {
+      batches.push(current);
+      current = [node];
+    } else {
+      current = grown;
+    }
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
+
 function userContent(input: FileCruxInput): string {
   const targets = input.nodes
     .map(
@@ -191,11 +241,7 @@ export class ChatCruxSummarizer implements CruxSummarizer {
     if (input.nodes.length === 0) return [];
     const out: NodeCrux[] = [];
     let refused = 0;
-    // Batch in line order so each window is the tight range around its targets
-    // rather than a span reaching across the whole file.
-    const ordered = [...input.nodes].sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
-    for (let i = 0; i < ordered.length; i += MAX_TARGETS_PER_CALL) {
-      const batch = ordered.slice(i, i + MAX_TARGETS_PER_CALL);
+    for (const batch of batchTargets(input.nodes, input.source)) {
       const got = await this.describeBatch({ ...input, nodes: batch });
       if (got === null) refused++;
       else out.push(...got);

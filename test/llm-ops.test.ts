@@ -166,3 +166,49 @@ test("ChatCruxSummarizer puts the id last and recovers decorated ids", async () 
   assert.match(sent, /\| id=a\.ts#f$/m);
   assert.deepEqual(out.map((o) => o.id).sort(), ["a.ts#f", "a.ts#g"]);
 });
+
+test("ChatCruxSummarizer keeps every target inside the source window it sends", async () => {
+  // Twenty large definitions span more source than one request carries; capping
+  // on count alone cut the surplus from the text while still asking about it,
+  // and the model answered for code it could not see.
+  const body = `${"x".repeat(200)}\n`.repeat(400); // 400 lines, ~80k chars
+  const source = body;
+  const nodes = Array.from({ length: 12 }, (_, i) => ({
+    id: `s${i}`,
+    kind: "function" as const,
+    signature: null,
+    startLine: i * 30 + 1,
+    endLine: i * 30 + 30,
+  }));
+  const windows: Array<{ ids: string[]; lines: number[] }> = [];
+  const model: ChatModel = {
+    label: "fake:window",
+    async create(req) {
+      const text = String(req.messages[1].content);
+      const ids = [...text.matchAll(/\| id=(.+)$/gm)].map((m) => m[1]);
+      const lines = [...text.matchAll(/^(\d+)\t/gm)].map((m) => Number(m[1]));
+      windows.push({ ids, lines });
+      return {
+        text: "",
+        toolCalls: [
+          { id: "1", name: "record_symbols",
+            args: { symbols: ids.map((id) => ({ id, summary: "s", crux_start: 0, crux_end: 0 })) } },
+        ],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 },
+        stopReason: "stop" as const,
+        assistant: { role: "assistant" as const, content: "" },
+      };
+    },
+  };
+  const out = await new ChatCruxSummarizer(model).describeFile({ path: "big.ts", source, nodes });
+  assert.ok(windows.length > 1, "12 large targets must not ride in a single call");
+  for (const w of windows) {
+    const shown = new Set(w.lines);
+    for (const id of w.ids) {
+      const n = nodes.find((x) => x.id === id)!;
+      assert.ok(shown.has(n.startLine), `${id} asked about but line ${n.startLine} not sent`);
+      assert.ok(shown.has(n.endLine), `${id} asked about but line ${n.endLine} not sent`);
+    }
+  }
+  assert.equal(out.length, nodes.length);
+});
