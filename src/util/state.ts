@@ -76,6 +76,11 @@ export interface BuildConfig {
   /** Whether initialized Git submodules are folded into this repo's graph.
    * Absent/false keeps the historical boundary at the superproject. */
   followSubmodules?: boolean;
+  /** Whether `--lsp` compiler-grade enrichment applies to this repo. Persisted
+   * for the same reason `includeDirs` is: the automatic refresh path never sees
+   * a CLI flag, so without this every refresh silently drops the LSP edges the
+   * last explicit build paid for. */
+  lsp?: boolean;
 }
 
 /** Local, Git-ignored repository configuration. Kept outside generated
@@ -126,6 +131,12 @@ export function readIncludeDirs(d: string): Set<string> | undefined {
 /** Missing and explicit false both retain the backwards-compatible default. */
 export function readFollowSubmodules(d: string): boolean {
   return readBuildConfig(d)?.followSubmodules === true;
+}
+
+/** The persisted `--lsp` choice. Missing counts as off, so a repo that never
+ * passed the flag is unaffected. */
+export function readLspEnabled(d: string): boolean {
+  return readBuildConfig(d)?.lsp === true;
 }
 // Best-effort read-modify-write; not atomic across concurrent processes, but acceptable
 // for episodic hook writes (worst case is a lost update, not corruption).

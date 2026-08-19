@@ -36,7 +36,7 @@ import { planInit, selectedWrites } from "./hosts/plan.js";
 import { formatNonInteractiveHelp, formatPlan, runPicker } from "./cli-picker.js";
 import { homedir } from "node:os";
 import { formatUpgradeReport, formatVersionReport, getNpmViewVersion, readCurrentVersion, runUpgrade } from "./cli-meta.js";
-import { patchBuildConfig, type BuildConfig } from "./util/state.js";
+import { patchBuildConfig, readLspEnabled, type BuildConfig } from "./util/state.js";
 import { formatUpdateNudge, maybeRefreshInBackground, readUpdateCache, refreshUpdateCache, writeStamp } from "./upkeep.js";
 
 const program = new Command();
@@ -183,7 +183,14 @@ program
   .option("-e, --extensions <exts...>", 'code extensions to include (e.g. ".ts" ".py"); an extension with no parser is ignored with a warning that lists the supported set')
   .option("-j, --concurrency <n>", "files summarized in parallel during --deep (default 5)")
   .option("--no-reuse", "re-parse every file instead of replaying unchanged ones from the extraction cache")
-  .option("--lsp", "add compiler-grade call edges via a language server if one is installed (opt-in, slower; e.g. rust-analyzer, clangd)")
+  .option(
+    "--lsp",
+    "add compiler-grade call edges via a language server if one is installed (opt-in, slower; e.g. rust-analyzer, clangd); persisted for later builds and automatic refreshes",
+  )
+  .option(
+    "--no-lsp",
+    "skip language-server enrichment; persisted for later builds and automatic refreshes (default)",
+  )
   .option(
     "--follow-submodules",
     "include initialized Git submodules recursively; persisted for later builds and automatic refreshes",
@@ -243,6 +250,10 @@ program
     const followSubmodulesWasExplicit = command.getOptionValueSource("followSubmodules") === "cli";
     if (followSubmodulesWasExplicit && typeof opts.followSubmodules === "boolean") {
       buildConfigPatch.followSubmodules = opts.followSubmodules;
+    }
+    const lspWasExplicit = command.getOptionValueSource("lsp") === "cli";
+    if (lspWasExplicit && typeof opts.lsp === "boolean") {
+      buildConfigPatch.lsp = opts.lsp;
     }
     if (Object.keys(buildConfigPatch).length > 0) {
       patchBuildConfig(resolve(dir), buildConfigPatch);
@@ -308,7 +319,9 @@ program
       llm: deep,
       concurrency,
       reuse: opts.reuse,
-      lsp: opts.lsp,
+      // An explicit flag wins for this run; otherwise honour what was persisted,
+      // so `graft build` keeps the enrichment the last `--lsp` build asked for.
+      lsp: lspWasExplicit ? opts.lsp : readLspEnabled(resolve(dir)),
       onProgress: ({ phase, index, total, file }) =>
         process.stderr.write(
           `\r${phase === "enrich" ? "summarizing" : "parsing"} ${index + 1}/${total}: ${file.slice(0, 50).padEnd(50)}`,
