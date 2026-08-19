@@ -214,15 +214,26 @@ export function extractGeneric(rel: string, source: string, langName: string): E
   const entry = loaded.get(langName);
   if (!entry || !tsMod) return { nodes, rawEdges };
 
+  // web-tree-sitter allocates both the Parser and the Tree in the wasm heap, and
+  // only an explicit delete() releases them. wasm32 linear memory is capped near
+  // 4 GB, so leaking one of each per file exhausts it partway through a large
+  // repo and V8 aborts the process ("Fatal process out of memory: Zone") — a
+  // failure no --max-old-space-size can affect, because it isn't the JS heap.
+  // Both are freed on every path out of this function.
   let tree;
+  let parser;
   try {
-    const parser = new tsMod.Parser();
+    parser = new tsMod.Parser();
     parser.setLanguage(entry.language as never);
     tree = parser.parse((i: number) => source.slice(i, i + PARSE_CHUNK));
   } catch {
+    parser?.delete();
     return { nodes, rawEdges };
   }
-  if (!tree) return { nodes, rawEdges };
+  if (!tree) {
+    parser.delete();
+    return { nodes, rawEdges };
+  }
 
   const minted = new Set<string>([rel]);
   const lines = source.split("\n");
@@ -254,17 +265,22 @@ export function extractGeneric(rel: string, source: string, langName: string): E
     defs.push({ id, startIndex: whole.startIndex, endIndex: whole.endIndex });
   };
 
-  if (entry.query) {
-    tagsExtract(entry.query, tree.rootNode as TsNode, rel, mkDef, defs, rawEdges);
-  } else {
-    walkExtract(tree.rootNode as TsNode, mkDef); // no tags.scm → symbols only
+  try {
+    if (entry.query) {
+      tagsExtract(entry.query, tree.rootNode as TsNode, rel, mkDef, defs, rawEdges);
+    } else {
+      walkExtract(tree.rootNode as TsNode, mkDef); // no tags.scm → symbols only
+    }
+    // The preprocessor is invisible to tags.scm, but in C/C++ a local `#include "x.h"`
+    // IS the dependency graph — capture it as a file→file import. Likewise a Rust
+    // `use crate::…` is an in-crate module dependency.
+    if (langName === "c" || langName === "cpp") extractIncludes(tree.rootNode as TsNode, rel, rawEdges);
+    else if (langName === "rust") extractUses(tree.rootNode as TsNode, rel, rawEdges);
+    else if (langName === "php") extractPhpUses(tree.rootNode as TsNode, rel, rawEdges);
+  } finally {
+    tree.delete();
+    parser.delete();
   }
-  // The preprocessor is invisible to tags.scm, but in C/C++ a local `#include "x.h"`
-  // IS the dependency graph — capture it as a file→file import. Likewise a Rust
-  // `use crate::…` is an in-crate module dependency.
-  if (langName === "c" || langName === "cpp") extractIncludes(tree.rootNode as TsNode, rel, rawEdges);
-  else if (langName === "rust") extractUses(tree.rootNode as TsNode, rel, rawEdges);
-  else if (langName === "php") extractPhpUses(tree.rootNode as TsNode, rel, rawEdges);
   return { nodes, rawEdges };
 }
 
