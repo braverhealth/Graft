@@ -39,7 +39,7 @@ import { extractorStamp } from "../extract-cache.js";
 import type { EdgeV1 } from "../types.js";
 
 /** Bump when the on-disk shape below changes. */
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 2;
 export const LSP_CACHE_PREFIX = "lsp";
 
 export interface LspEdgeCache {
@@ -50,17 +50,46 @@ export interface LspEdgeCache {
   extractor: string;
   /** Which servers produced these edges; a different set invalidates the memo. */
   servers: string;
-  /** repo-relative path of an edge's SOURCE file → its content hash at the time
-   * the server answered, and the edges rooted in it. The hash is what makes the
-   * entry verifiable: if the file's bytes are unchanged, the server would say
-   * the same thing again. */
-  files: Record<string, LspFileEntry>;
+  /** repo-relative path of an edge's SOURCE file → the last few answers the
+   * server gave for it, newest first, each tagged with the content hash it was
+   * derived from.
+   *
+   * More than one, because switching branches switches files back as often as it
+   * switches them forward: reviewing a PR and returning to your own branch puts
+   * every file back to bytes that were already asked about. Keeping one answer
+   * per file made that return trip pay the full query pass again. */
+  files: Record<string, LspFileEntry[]>;
 }
 
 export interface LspFileEntry {
   /** sha256 of the source file when these edges were derived. */
   hash: string;
   edges: EdgeV1[];
+}
+
+/** Answers kept per file. Three covers the common shuttle — your branch, the
+ * one you are reviewing, and main — without turning the memo into a log. */
+export const MAX_GENERATIONS = 3;
+
+/** Put `entry` at the front of a file's history, replacing any answer for the
+ * same content, and drop the oldest beyond {@link MAX_GENERATIONS}. */
+export function rememberGeneration(
+  files: Record<string, LspFileEntry[]>,
+  rel: string,
+  entry: LspFileEntry,
+): void {
+  const rest = (files[rel] ?? []).filter((g) => g.hash !== entry.hash);
+  files[rel] = [entry, ...rest].slice(0, MAX_GENERATIONS);
+}
+
+/** The stored answer for this file's current content, if it was ever asked. */
+export function generationFor(
+  files: Record<string, LspFileEntry[]>,
+  rel: string,
+  hash: string | undefined,
+): LspFileEntry | undefined {
+  if (!hash) return undefined;
+  return (files[rel] ?? []).find((g) => g.hash === hash);
 }
 
 export function emptyLspEdgeCache(servers = ""): LspEdgeCache {

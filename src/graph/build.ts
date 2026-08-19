@@ -423,8 +423,14 @@ export async function buildGraph(
   // touches the extraction cache (Tier-1 stays pristine, cold==incremental).
   if (opts.lsp || opts.lspReplayOnly) {
     const { enrichWithLsp } = await import("./lsp/enrich.js");
-    const { readLspEdgeCache, writeLspEdgeCache, emptyLspEdgeCache } =
-      await import("./lsp/edge-cache.js");
+    const {
+      readLspEdgeCache,
+      writeLspEdgeCache,
+      emptyLspEdgeCache,
+      generationFor,
+      rememberGeneration,
+      MAX_GENERATIONS,
+    } = await import("./lsp/edge-cache.js");
     type LspFileEntry = { hash: string; edges: EdgeV1[] };
     const { pickServers } = await import("./lsp/registry.js");
     const { genericLangOf: gl } = await import("./generic.js");
@@ -451,19 +457,22 @@ export async function buildGraph(
       graph.edges.map((e) => `${e.source}\0${e.relation}\0${e.target}`),
     );
 
-    // Replay the edges of every file that didn't move. An edge is dropped when
-    // either end no longer exists, because a *different* file changing can
-    // delete the node this one pointed at.
-    const carried: Record<string, LspFileEntry> = {};
-    for (const [rel, held] of Object.entries(prior.files)) {
-      if (reparsed.has(rel) || !sources.has(rel)) continue; // changed, or gone from the repo
-      // The hash is the entry's warrant: unchanged bytes mean the server would
-      // answer the same way, whatever version of graft asked last time.
-      if (held.hash !== entries[rel]?.hash) continue;
-      const live = held.edges.filter(
+    // Replay whatever the server already said about each file's CURRENT
+    // content. Keyed on the hash rather than on "did this file change", so a
+    // file that changed back — the return leg of a branch switch — replays
+    // instead of being asked again. An edge is dropped when either end no longer
+    // exists, because a different file changing can delete the node this one
+    // pointed at.
+    const carried: Record<string, LspFileEntry[]> = {};
+    for (const [rel, history] of Object.entries(prior.files)) {
+      if (!sources.has(rel)) continue; // gone from the repo
+      carried[rel] = history.slice(0, MAX_GENERATIONS);
+      const match = generationFor(carried, rel, entries[rel]?.hash);
+      if (!match) continue; // nothing stored for the bytes on disk right now
+      const live = match.edges.filter(
         (e) => nodeIds.has(e.source) && nodeIds.has(e.target),
       );
-      carried[rel] = { hash: held.hash, edges: live };
+      match.edges = live;
       for (const e of live) {
         const key = `${e.source}\0${e.relation}\0${e.target}`;
         if (seen.has(key)) continue;
@@ -472,17 +481,15 @@ export async function buildGraph(
       }
     }
 
-    // Ask the servers about the rest: the files that changed, plus any the memo
-    // has never covered. That second half is what makes enabling `--lsp` on a
-    // repo that was built without it actually backfill — keyed on changed files
-    // alone, a build after the flag was turned on queries nothing, because
-    // nothing changed, and the edges never appear.
+    // Ask only about files with no stored answer for their current content.
+    // That covers a file that changed, one the memo never saw, and one whose
+    // language became servable since — without re-asking about anything already
+    // known, whichever branch it came from.
+    const unanswered = (rel: string) =>
+      !generationFor(prior.files, rel, entries[rel]?.hash);
     const onlyFiles = cold
       ? undefined
-      : new Set([
-          ...reparsed,
-          ...[...sources.keys()].filter((rel) => !(rel in prior.files)),
-        ]);
+      : new Set([...sources.keys()].filter(unanswered));
     const r = opts.lspReplayOnly
       ? {
           added: 0,
@@ -495,34 +502,29 @@ export async function buildGraph(
 
     const next = emptyLspEdgeCache(serverIds);
     next.files = carried;
-    if (opts.lspReplayOnly) {
-      // Nothing was re-derived, so keep what a changed file had rather than
-      // erasing it — the next explicit `--lsp` build replaces it wholesale.
-      for (const rel of reparsed) {
-        const held = prior.files[rel];
-        if (held) next.files[rel] = held;
-      }
-    }
-    for (const rel of r.queriedFiles) {
-      next.files[rel] = { hash: entries[rel]?.hash ?? "", edges: [] };
-    }
-    // Record every file this pass CONSIDERED, not just the ones it had something
-    // to ask about. A file with no callables, or one in a language no installed
-    // server covers, otherwise stays "never asked" forever: it lands in the
-    // backfill set on every later build, which keeps that set non-empty and
-    // respawns a language server — 58s of workspace indexing — on a build where
-    // nothing changed at all.
+    // Every file this pass asked about gets an answer recorded, even an empty
+    // one: "asked, nothing to say" is what stops it being asked forever, which
+    // otherwise respawns a language server on a build with nothing to do.
     if (!opts.lspReplayOnly) {
+      for (const rel of r.queriedFiles) {
+        rememberGeneration(next.files, rel, { hash: entries[rel]?.hash ?? "", edges: [] });
+      }
       for (const rel of sources.keys()) {
-        if (reparsed.has(rel) || !(rel in prior.files)) {
-          next.files[rel] ??= { hash: entries[rel]?.hash ?? "", edges: [] };
+        if (unanswered(rel)) {
+          const hash = entries[rel]?.hash ?? "";
+          if (!generationFor(next.files, rel, hash)) {
+            rememberGeneration(next.files, rel, { hash, edges: [] });
+          }
         }
       }
     }
     for (const e of r.addedEdges) {
       const rel = byIdPath.get(e.source);
       if (!rel) continue;
-      (next.files[rel] ??= { hash: entries[rel]?.hash ?? "", edges: [] }).edges.push(e);
+      const hash = entries[rel]?.hash ?? "";
+      const gen = generationFor(next.files, rel, hash);
+      if (gen) gen.edges.push(e);
+      else rememberGeneration(next.files, rel, { hash, edges: [e] });
     }
     writeLspEdgeCache(outDir, next);
 
