@@ -24,6 +24,8 @@ export interface OpenAIChatModelOptions {
   label?: string;
   /** Extra default headers (e.g. OpenRouter's `X-Title`). */
   headers?: Record<string, string>;
+  /** Sent as `reasoning_effort` on every request when set. */
+  reasoningEffort?: string;
   /** Inject a pre-built client (tests pass a stub; production omits it). */
   client?: OpenAI;
 }
@@ -88,9 +90,11 @@ export class OpenAIChatModel implements ChatModel {
   readonly label: string;
   private client: OpenAI;
   private model: string;
+  private reasoningEffort?: string;
 
   constructor(opts: OpenAIChatModelOptions) {
     this.model = opts.model;
+    this.reasoningEffort = opts.reasoningEffort;
     this.label = opts.label ?? `${PROVIDER}:${opts.model}`;
     this.client =
       opts.client ??
@@ -107,6 +111,9 @@ export class OpenAIChatModel implements ChatModel {
     const params: ChatParams = { model: this.model, messages };
     if (req.temperature !== undefined) params.temperature = req.temperature;
     if (req.maxTokens !== undefined) params.max_tokens = req.maxTokens;
+    if (this.reasoningEffort !== undefined) {
+      (params as unknown as Record<string, unknown>).reasoning_effort = this.reasoningEffort;
+    }
 
     const fmt = req.responseFormat ?? { kind: "text" };
     if (fmt.kind === "json") {
