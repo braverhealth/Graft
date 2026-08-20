@@ -200,6 +200,19 @@ program
     "exclude Git submodules; persisted for later builds and automatic refreshes (default)",
   )
   .option(
+    "--exclude <glob>",
+    "leave files matching this glob out of the graph entirely — repeatable " +
+      "(e.g. --exclude '**/*.freezed.dart' --exclude '**/web/*.js'); a pattern with no " +
+      "slash matches a file NAME anywhere; persisted, so later builds and the hooks/refresh " +
+      "path exclude it without the flag",
+    (val: string, prev: string[]) => [...prev, val],
+    [] as string[],
+  )
+  .option(
+    "--no-exclude",
+    "clear this repo's persisted --exclude globs and index everything again",
+  )
+  .option(
     "--include-dir <name>",
     "override SKIP_DIRS for this repo's walks — repeatable (e.g. --include-dir build --include-dir tools); " +
       "persisted, so a later build (and the hooks/refresh path) include it without the flag; dot-dirs are never overridable",
@@ -212,6 +225,7 @@ program
       deep?: boolean;
       extensions?: string[];
       concurrency?: string;
+      exclude?: string[] | false;
       reuse?: boolean;
       lsp?: boolean;
       includeDir?: string[];
@@ -247,6 +261,9 @@ program
       }
       buildConfigPatch.includeDirs = opts.includeDir;
     }
+    if (opts.exclude && opts.exclude.length > 0) buildConfigPatch.exclude = opts.exclude;
+    // `--no-exclude` leaves commander's `exclude` as false rather than an array.
+    if (opts.exclude === false) buildConfigPatch.exclude = [];
     const followSubmodulesWasExplicit = command.getOptionValueSource("followSubmodules") === "cli";
     if (followSubmodulesWasExplicit && typeof opts.followSubmodules === "boolean") {
       buildConfigPatch.followSubmodules = opts.followSubmodules;

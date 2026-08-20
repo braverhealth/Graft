@@ -10,7 +10,8 @@ import { statSync } from "node:fs";
 import { resolve } from "node:path";
 import { walkDir } from "../ingest/fs.js";
 import { relPosix } from "../util/paths.js";
-import { readFollowSubmodules, readIncludeDirs } from "../util/state.js";
+import { readExcludes, readFollowSubmodules, readIncludeDirs } from "../util/state.js";
+import { compileGlobs, matchesAny } from "../util/globs.js";
 import { languageOf, depthExtensions } from "./extract.js";
 import { genericLangOf, genericExtensions } from "./generic.js";
 import { containerLangOf, containerExtensions } from "./container.js";
@@ -52,13 +53,19 @@ export function listSourceFiles(
     followSubmodules: readFollowSubmodules(resolve(root)),
   }),
 ): string[] {
+  // Exclusion is applied HERE rather than in the walk so it covers callers that
+  // pass their own `repoFiles` too. This function is the single definition of
+  // "the files this repo indexes"; a set that differed between the builder and
+  // the freshness probe would leave every refresh believing files went missing.
+  const excluded = compileGlobs(readExcludes(resolve(root)));
   // A file is a source file if a depth-tier grammar (languageOf), a breadth-tier
   // grammar (genericLangOf) or a container (containerLangOf) claims its extension.
   // All three must agree here or `build` and `check` would enumerate different sets.
   return repoFiles.filter(
     (f) =>
       !f.startsWith(outDir) &&
-      (languageOf(f) !== null || genericLangOf(f) !== null || containerLangOf(f) !== null),
+      (languageOf(f) !== null || genericLangOf(f) !== null || containerLangOf(f) !== null) &&
+      !matchesAny(relPosix(root, f), excluded),
   );
 }
 
