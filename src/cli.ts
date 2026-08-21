@@ -200,6 +200,15 @@ program
     "exclude Git submodules; persisted for later builds and automatic refreshes (default)",
   )
   .option(
+    "--seed-in <file>",
+    "fold summaries from a seed file another machine's build wrote — only entries whose " +
+      "code is unchanged are used, so a stale seed costs coverage, never correctness",
+  )
+  .option(
+    "--seed-out <file>",
+    "write this build's summaries to a seed file other machines can fold in with --seed-in",
+  )
+  .option(
     "--exclude <glob>",
     "leave files matching this glob out of the graph entirely — repeatable " +
       "(e.g. --exclude '**/*.freezed.dart' --exclude '**/web/*.js'); a pattern with no " +
@@ -225,6 +234,8 @@ program
       deep?: boolean;
       extensions?: string[];
       concurrency?: string;
+      seedIn?: string;
+      seedOut?: string;
       exclude?: string[] | false;
       reuse?: boolean;
       lsp?: boolean;
@@ -335,6 +346,8 @@ program
     const g = await engine.graph(dir, {
       llm: deep,
       concurrency,
+      seedIn: opts.seedIn,
+      seedOut: opts.seedOut,
       reuse: opts.reuse,
       // An explicit flag wins for this run; otherwise honour what was persisted,
       // so `graft build` keeps the enrichment the last `--lsp` build asked for.
@@ -349,6 +362,13 @@ program
     console.log(`  parsed: ${g.parsed} of ${g.files} files (${g.reused} replayed from cache)`);
     // Worth one line: this build started from a graph the user never built *here*.
     if (g.seededFrom) console.log(`  seeded: copied a starting graph from ${g.seededFrom} (git worktree)`);
+    // Silence here would be indistinguishable from a seed that matched nothing —
+    // the failure mode a wrong-repo or long-stale file actually produces.
+    if (opts.seedIn) {
+      const pct = g.nodes ? Math.round((100 * (g.seededSummaries ?? 0)) / g.nodes) : 0;
+      console.log(`  seed: folded ${g.seededSummaries ?? 0} of ${g.nodes} nodes from ${opts.seedIn} (${pct}%)`);
+    }
+    if (g.wroteSeed) console.log(`  seed: wrote ${g.wroteSeed.nodes} summaries → ${g.wroteSeed.path}`);
     if (deep) {
       const m = g.meaning;
       console.log(`  meaning: ${m.computed} computed, ${m.cached} cached, ${m.stale} stale, ${m.pending} pending`);

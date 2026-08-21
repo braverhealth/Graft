@@ -54,6 +54,7 @@ import { seedGraph, type SeedResult } from "./seed.js";
 import { listSourceStats } from "./source-files.js";
 import { resolveEdges, type GoModule } from "./resolve.js";
 import { enrichGraph, type EnrichStats } from "./enrich.js";
+import { readSeedFile, writeSeedFile } from "./seed-file.js";
 import { readGraph, writeGraph, wiringPath } from "./write.js";
 import {
   writeCards,
@@ -129,6 +130,12 @@ export interface GraphBuildOptions {
   summarizer?: CruxSummarizer;
   /** Max files summarized in parallel during the Tier-2 pass. Default is set in enrich. */
   concurrency?: number;
+  /** Fold summaries from a seed file written by another machine's build
+   * (`--seed-in`). Only entries whose body hash matches the code here are used,
+   * so a seed can lower coverage but never make a summary wrong. */
+  seedIn?: string;
+  /** After building, write this build's summaries to a seed file (`--seed-out`). */
+  seedOut?: string;
   onProgress?: (info: {
     phase: "parse" | "enrich";
     index: number;
@@ -150,6 +157,11 @@ export interface GraphBuildResult {
   /** The parent checkout this build copied a starting graph from, when it was run in
    * a git worktree that had none of its own. See `./seed.ts`. */
   seededFrom?: string;
+  /** Summaries adopted from a `--seed-in` file — nodes this machine would
+   * otherwise have had to pay a model to describe. */
+  seededSummaries?: number;
+  /** Summaries written to a `--seed-out` file. */
+  wroteSeed?: { path: string; nodes: number };
   nodes: number;
   edges: number;
   byKind: Record<Kind, number>;
@@ -394,6 +406,32 @@ export async function buildGraph(
   // unchanged body is never re-summarized (and a Tier-1-only run never wipes it).
   const prior = readGraph(wiringPath(outDir));
   const priorById = new Map((prior?.nodes ?? []).map((n) => [n.id, n]));
+
+  // A seed stands in for a prior this machine never had. Whoever paid for these
+  // summaries ran the same pass over the same code, so the only question worth
+  // asking is the one `enrichGraph` already asks: does the body hash still
+  // match? Entries are shaped into nodes and dropped into the same map, so the
+  // reuse rule below has a single definition rather than a second one for seeds.
+  let seeded = 0;
+  if (opts.seedIn) {
+    const seedEntries = await readSeedFile(opts.seedIn);
+    for (const node of nodes) {
+      const local = priorById.get(node.id);
+      // A local prior describing this exact body is already what the seed would
+      // supply; anything else (stale, or nothing at all) the seed may improve on.
+      if (local?.summary_state === "ready" && local.body_hash === node.body_hash) continue;
+      const entry = seedEntries.get(node.id);
+      if (!entry || entry.h !== node.body_hash) continue;
+      priorById.set(node.id, {
+        ...node,
+        summary: entry.s,
+        crux: entry.c ?? null,
+        summary_state: "ready",
+        body_hash: entry.h,
+      });
+      seeded++;
+    }
+  }
   const meaning = await enrichGraph(nodes, priorById, sources, {
     summarizer: opts.summarizer,
     concurrency: opts.concurrency,
@@ -538,6 +576,15 @@ export async function buildGraph(
   }
 
   const graphPath = writeGraph(graph, outDir);
+
+  // Export before the projections below: the seed is derived purely from the
+  // graph's nodes, so a failure writing cards must not cost the artifact other
+  // machines are waiting on.
+  let wroteSeed: GraphBuildResult["wroteSeed"];
+  if (opts.seedOut) {
+    const written = writeSeedFile(opts.seedOut, graph.nodes, {});
+    wroteSeed = { path: opts.seedOut, nodes: written };
+  }
   // `ask`'s token/IDF sidecar — moves per-query corpus tokenization to build
   // time (~45% of query time on a 32k-node graph, profiled). Lives in the
   // cache dir; `ask` falls back to live tokenization when it's absent/stale.
@@ -603,6 +650,8 @@ export async function buildGraph(
     parsed,
     reused,
     seededFrom: seed.from,
+    seededSummaries: seeded || undefined,
+    wroteSeed,
     nodes: nodes.length,
     edges: edges.length,
     byKind,

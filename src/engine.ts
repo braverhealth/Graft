@@ -45,6 +45,10 @@ export interface GraphRunOptions {
   reuse?: boolean;
   /** Opt-in compiler-grade LSP edge enrichment (`graft build --lsp`). */
   lsp?: boolean;
+  /** Fold summaries from a seed file another machine's build wrote. */
+  seedIn?: string;
+  /** Write this build's summaries to a seed file. */
+  seedOut?: string;
   onProgress?: GraphBuildOptions["onProgress"];
 }
 
@@ -90,6 +94,8 @@ export class Graft {
       concurrency: opts.concurrency,
       reuse: opts.reuse,
       lsp: opts.lsp,
+      seedIn: opts.seedIn,
+      seedOut: opts.seedOut,
       onProgress: opts.onProgress,
     });
   }
