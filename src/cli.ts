@@ -330,6 +330,7 @@ program
     if (deep) {
       const c = await engine.init(dir, {
         extensions: opts.extensions,
+        seedIn: opts.seedIn,
         onProgress: ({ phase, index, total, file }) =>
           process.stderr.write(
             `\r${phase === "summarize" ? "reading" : "writing"} concepts ${index + 1}/${total}: ${file.slice(0, 40).padEnd(40)}`,

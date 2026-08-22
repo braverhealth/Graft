@@ -54,6 +54,7 @@ import { seedGraph, type SeedResult } from "./seed.js";
 import { listSourceStats } from "./source-files.js";
 import { resolveEdges, type GoModule } from "./resolve.js";
 import { enrichGraph, type EnrichStats } from "./enrich.js";
+import { readContextCache } from "../context/build.js";
 import { readSeedFile, writeSeedFile } from "./seed-file.js";
 import { readGraph, writeGraph, wiringPath } from "./write.js";
 import {
@@ -414,7 +415,7 @@ export async function buildGraph(
   // reuse rule below has a single definition rather than a second one for seeds.
   let seeded = 0;
   if (opts.seedIn) {
-    const seedEntries = await readSeedFile(opts.seedIn);
+    const seedEntries = (await readSeedFile(opts.seedIn)).nodes;
     for (const node of nodes) {
       const local = priorById.get(node.id);
       // A local prior describing this exact body is already what the seed would
@@ -582,7 +583,10 @@ export async function buildGraph(
   // machines are waiting on.
   let wroteSeed: GraphBuildResult["wroteSeed"];
   if (opts.seedOut) {
-    const written = writeSeedFile(opts.seedOut, graph.nodes, {});
+    // Both LLM layers travel: per-symbol summaries from this graph, and the
+    // per-file prose the concepts pass caches separately. Shipping only the
+    // first left every consumer recomputing the second at full price.
+    const written = writeSeedFile(opts.seedOut, graph.nodes, {}, readContextCache(outDir));
     wroteSeed = { path: opts.seedOut, nodes: written };
   }
   // `ask`'s token/IDF sidecar — moves per-query corpus tokenization to build

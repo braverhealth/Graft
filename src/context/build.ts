@@ -11,6 +11,7 @@
  *      source files so staleness stays exact.
  *   5. Write one markdown file per node (preserving human notes) + a manifest.
  */
+import { readSeedFile } from "../graph/seed-file.js";
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { walkDir } from "../ingest/fs.js";
@@ -65,6 +66,10 @@ export interface BuildOptions {
   synthesizer: Synthesizer;
   /** Files summarized in parallel during phase 1. Default 8. Raised via `graft build -j`. */
   concurrency?: number;
+  /** Prime the cache from a seed file another machine's build wrote, so this run
+   * pays only for files whose content it has not seen. Entries still have to
+   * match by hash, so a stale seed costs coverage rather than correctness. */
+  seedIn?: string;
   onProgress?: (info: BuildProgress) => void;
 }
 
@@ -114,6 +119,15 @@ export async function buildContext(dir: string, opts: BuildOptions): Promise<Bui
     .filter((f) => !f.startsWith(outDir));
 
   const cache = loadCache(outDir);
+  // A seed stands in for a cache this machine never had. Without it CI re-reads
+  // every file through a model on each run, whatever the diff.
+  if (opts.seedIn) {
+    const { context } = await readSeedFile(opts.seedIn);
+    // Local entries win: they describe this checkout, and were written by a run
+    // that had the file in front of it.
+    cache.summaries = { ...context.summaries, ...cache.summaries };
+    cache.synth = { ...(context.synth as BuildCache["synth"]), ...cache.synth };
+  }
   // Flush the summary cache to disk during phase 1 so a build interrupted
   // partway (session/rate limit, crash, Ctrl-C) resumes without re-summarizing
   // the files it already did. Throttled to keep disk churn negligible; on the
@@ -333,6 +347,16 @@ function resolveSlug(table: Map<string, string>, name: string): string | undefin
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** The concepts cache for `outDir`, so a seed can carry it between machines. */
+export function contextCachePath(outDir: string): string {
+  return cachePath(outDir);
+}
+
+/** The concepts cache as stored, or empty when there is none. */
+export function readContextCache(outDir: string): BuildCache {
+  return loadCache(outDir);
 }
 
 function cachePath(outDir: string): string {

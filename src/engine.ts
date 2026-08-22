@@ -28,6 +28,8 @@ export type { BuildResult, BuildProgress, CheckResult, GraphBuildResult, GraphCh
 export interface InitOptions {
   /** Code extensions to include. Default: {@link CODE_EXTENSIONS}. */
   extensions?: string[];
+  /** Prime the concepts cache from a seed file another build wrote. */
+  seedIn?: string;
   /** Progress callback for long builds. */
   onProgress?: (info: BuildProgress) => void;
 }
@@ -67,6 +69,7 @@ export class Graft {
       model: this.modelLabel(),
       summarizer: this.summarizer(),
       synthesizer: this.synthesizer(),
+      seedIn: opts.seedIn,
       onProgress: opts.onProgress,
     });
   }
