@@ -198,17 +198,33 @@ export async function buildContext(dir: string, opts: BuildOptions): Promise<Bui
   const batches = batchBySize(summarized, BATCH_CHAR_BUDGET);
   result.batches = batches.length;
 
-  const synthNodes: SynthNode[] = [];
-  for (let b = 0; b < batches.length; b++) {
-    opts.onProgress?.({ phase: "synthesize", index: b, total: batches.length, file: `batch ${b + 1}` });
-    const key = batchKey(batches[b], hashByPath);
-    let nodes = cache.synth[key];
-    if (!nodes) {
-      nodes = await opts.synthesizer.synthesize(batches[b]);
-      cache.synth[key] = nodes;
-    }
-    synthNodes.push(...nodes);
-  }
+  // Concurrent for the same reason phase 1 is: each batch is an independent
+  // request, and the wait dominates. Run sequentially these 45-odd calls cost
+  // more wall time than the 2,400 file summaries above, because those honour
+  // `-j` and these did not. Batches share no state, and the cache is written
+  // per key, so ordering does not matter; `mapWithConcurrency` preserves result
+  // order, which keeps the assembled node list stable between runs.
+  let synthDone = 0;
+  const perBatch = await mapWithConcurrency(
+    batches,
+    Math.max(1, opts.concurrency ?? 8),
+    async (batch): Promise<SynthNode[]> => {
+      const key = batchKey(batch, hashByPath);
+      const hit = cache.synth[key];
+      const nodes = hit ?? (await opts.synthesizer.synthesize(batch));
+      if (!hit) cache.synth[key] = nodes;
+      // Reported on completion so the counter climbs monotonically under
+      // concurrency, rather than jumping around with whichever call lands next.
+      opts.onProgress?.({
+        phase: "synthesize",
+        index: synthDone++,
+        total: batches.length,
+        file: `batch ${synthDone}`,
+      });
+      return nodes;
+    },
+  );
+  const synthNodes: SynthNode[] = perBatch.flat();
   // Drop cache entries for batches we no longer produce, so it can't grow forever.
   cache.synth = Object.fromEntries(
     batches.map((batch) => [batchKey(batch, hashByPath), cache.synth[batchKey(batch, hashByPath)] ?? []]),

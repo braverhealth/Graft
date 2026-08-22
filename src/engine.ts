@@ -30,6 +30,8 @@ export interface InitOptions {
   extensions?: string[];
   /** Prime the concepts cache from a seed file another build wrote. */
   seedIn?: string;
+  /** Files summarized in parallel, and batches synthesized in parallel. */
+  concurrency?: number;
   /** Progress callback for long builds. */
   onProgress?: (info: BuildProgress) => void;
 }
@@ -70,6 +72,7 @@ export class Graft {
       summarizer: this.summarizer(),
       synthesizer: this.synthesizer(),
       seedIn: opts.seedIn,
+      concurrency: opts.concurrency,
       onProgress: opts.onProgress,
     });
   }
