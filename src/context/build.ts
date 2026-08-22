@@ -66,9 +66,8 @@ export interface BuildOptions {
   synthesizer: Synthesizer;
   /** Files summarized in parallel during phase 1. Default 8. Raised via `graft build -j`. */
   concurrency?: number;
-  /** Prime the cache from a seed file another machine's build wrote, so this run
-   * pays only for files whose content it has not seen. Entries still have to
-   * match by hash, so a stale seed costs coverage rather than correctness. */
+  /** Prime the cache from another build's seed. Entries match by hash, so a
+   * stale seed costs coverage rather than correctness. */
   seedIn?: string;
   onProgress?: (info: BuildProgress) => void;
 }
@@ -119,12 +118,10 @@ export async function buildContext(dir: string, opts: BuildOptions): Promise<Bui
     .filter((f) => !f.startsWith(outDir));
 
   const cache = loadCache(outDir);
-  // A seed stands in for a cache this machine never had. Without it CI re-reads
-  // every file through a model on each run, whatever the diff.
+  // Without this, a fresh checkout re-reads every file through a model.
   if (opts.seedIn) {
     const { context } = await readSeedFile(opts.seedIn);
-    // Local entries win: they describe this checkout, and were written by a run
-    // that had the file in front of it.
+    // Local entries win: they were written with the file in front of them.
     cache.summaries = { ...context.summaries, ...cache.summaries };
     cache.synth = { ...(context.synth as BuildCache["synth"]), ...cache.synth };
   }
@@ -198,12 +195,9 @@ export async function buildContext(dir: string, opts: BuildOptions): Promise<Bui
   const batches = batchBySize(summarized, BATCH_CHAR_BUDGET);
   result.batches = batches.length;
 
-  // Concurrent for the same reason phase 1 is: each batch is an independent
-  // request, and the wait dominates. Run sequentially these 45-odd calls cost
-  // more wall time than the 2,400 file summaries above, because those honour
-  // `-j` and these did not. Batches share no state, and the cache is written
-  // per key, so ordering does not matter; `mapWithConcurrency` preserves result
-  // order, which keeps the assembled node list stable between runs.
+  // Batches are independent requests and the wait dominates, so they run
+  // concurrently like phase 1. mapWithConcurrency preserves order, keeping the
+  // assembled node list stable between runs.
   let synthDone = 0;
   const perBatch = await mapWithConcurrency(
     batches,
@@ -213,8 +207,7 @@ export async function buildContext(dir: string, opts: BuildOptions): Promise<Bui
       const hit = cache.synth[key];
       const nodes = hit ?? (await opts.synthesizer.synthesize(batch));
       if (!hit) cache.synth[key] = nodes;
-      // Reported on completion so the counter climbs monotonically under
-      // concurrency, rather than jumping around with whichever call lands next.
+      // On completion, so the counter climbs rather than jumping.
       opts.onProgress?.({
         phase: "synthesize",
         index: synthDone++,

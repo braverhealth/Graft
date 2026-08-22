@@ -14,16 +14,12 @@
  * them would multiply the artifact by an order of magnitude to ship data the
  * receiver is going to recompute anyway.
  *
- * Two layers travel, because two LLM passes are cached separately and both are
- * expensive: per-symbol summaries from the wiring graph, and the per-file prose
- * that concept nodes are synthesized from. Shipping only the first left CI
- * recomputing the second on every merge — the same work, at full price, for a
- * diff of a few files.
+ * Both LLM-cached layers travel: per-symbol summaries, and the per-file prose
+ * concept nodes are synthesized from.
  *
- * Newline-delimited JSON, gzipped: a header line, then one line per record.
- * Records carry a `t` discriminator; node entries omit it, so a reader that
- * predates the file layer skips what it does not recognise and still gets every
- * summary it knows how to use.
+ * Gzipped NDJSON — a header, then one record per line. Records carry a `t`
+ * discriminator that node entries omit, so an older reader skips what it does
+ * not recognise and still folds every summary it knows.
  */
 import { createReadStream, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
