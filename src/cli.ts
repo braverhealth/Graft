@@ -37,7 +37,7 @@ import { planRetract, runRetract, changed, type Retraction } from "./hosts/retra
 import { formatNonInteractiveHelp, formatPlan, runPicker } from "./cli-picker.js";
 import { homedir } from "node:os";
 import { formatUpgradeReport, formatVersionReport, getNpmViewVersion, readCurrentVersion, runUpgrade } from "./cli-meta.js";
-import { patchBuildConfig, type BuildConfig } from "./util/state.js";
+import { patchBuildConfig, readLspEnabled, type BuildConfig } from "./util/state.js";
 import { normalizePathPrefix } from "./util/paths.js";
 import { formatUpdateNudge, maybeRefreshInBackground, readUpdateCache, refreshUpdateCache, writeStamp } from "./upkeep.js";
 import {
@@ -303,7 +303,14 @@ program
   .option("-e, --extensions <exts...>", 'code extensions to include (e.g. ".ts" ".py"); an extension with no parser is ignored with a warning that lists the supported set')
   .option("-j, --concurrency <n>", "files summarized in parallel during --deep (default 5)")
   .option("--no-reuse", "re-parse every file instead of replaying unchanged ones from the extraction cache")
-  .option("--lsp", "add compiler-grade call edges via a language server if one is installed (opt-in, slower; e.g. rust-analyzer, clangd)")
+  .option(
+    "--lsp",
+    "add compiler-grade call edges via a language server if one is installed (opt-in, slower; e.g. rust-analyzer, clangd); persisted for later builds and automatic refreshes",
+  )
+  .option(
+    "--no-lsp",
+    "skip language-server enrichment; persisted for later builds and automatic refreshes (default)",
+  )
   .option("--allow-partial", "with --deep: exit 0 even when some files' summaries failed (default: a degraded meaning tier exits 1)")
   .option(
     "--follow-submodules",
@@ -321,6 +328,28 @@ program
   .option(
     "--no-follow-nested-repos",
     "exclude untracked nested Git clones; persisted for later builds and automatic refreshes (default)",
+  )
+  .option(
+    "--seed-in <file>",
+    "fold summaries from a seed file another machine's build wrote — only entries whose " +
+      "code is unchanged are used, so a stale seed costs coverage, never correctness",
+  )
+  .option(
+    "--seed-out <file>",
+    "write this build's summaries to a seed file other machines can fold in with --seed-in",
+  )
+  .option(
+    "--exclude <glob>",
+    "leave files matching this glob out of the graph entirely — repeatable " +
+      "(e.g. --exclude '**/*.freezed.dart' --exclude '**/web/*.js'); a pattern with no " +
+      "slash matches a file NAME anywhere; persisted, so later builds and the hooks/refresh " +
+      "path exclude it without the flag",
+    (val: string, prev: string[]) => [...prev, val],
+    [] as string[],
+  )
+  .option(
+    "--no-exclude",
+    "clear this repo's persisted --exclude globs and index everything again",
   )
   .option(
     "--include-dir <name>",
@@ -344,6 +373,9 @@ program
       deep?: boolean;
       extensions?: string[];
       concurrency?: string;
+      seedIn?: string;
+      seedOut?: string;
+      exclude?: string[] | false;
       reuse?: boolean;
       lsp?: boolean;
       allowPartial?: boolean;
@@ -404,6 +436,9 @@ program
       }
       onlyDirs = normalized;
     }
+    if (opts.exclude && opts.exclude.length > 0) buildConfigPatch.exclude = opts.exclude;
+    // `--no-exclude` leaves commander's `exclude` as false rather than an array.
+    if (opts.exclude === false) buildConfigPatch.exclude = [];
     const followSubmodulesWasExplicit = command.getOptionValueSource("followSubmodules") === "cli";
     if (followSubmodulesWasExplicit && typeof opts.followSubmodules === "boolean") {
       buildConfigPatch.followSubmodules = opts.followSubmodules;
@@ -411,6 +446,10 @@ program
     const followNestedReposWasExplicit = command.getOptionValueSource("followNestedRepos") === "cli";
     if (followNestedReposWasExplicit && typeof opts.followNestedRepos === "boolean") {
       buildConfigPatch.followNestedRepos = opts.followNestedRepos;
+    }
+    const lspWasExplicit = command.getOptionValueSource("lsp") === "cli";
+    if (lspWasExplicit && typeof opts.lsp === "boolean") {
+      buildConfigPatch.lsp = opts.lsp;
     }
     if (Object.keys(buildConfigPatch).length > 0) {
       patchBuildConfig(resolve(dir), buildConfigPatch);
@@ -462,6 +501,8 @@ program
     if (deep) {
       const c = await engine.init(dir, {
         extensions: opts.extensions,
+        seedIn: opts.seedIn,
+        concurrency,
         onProgress: ({ phase, index, total, file }) =>
           process.stderr.write(
             `\r${phase === "summarize" ? "reading" : "writing"} concepts ${index + 1}/${total}: ${file.slice(0, 40).padEnd(40)}`,
@@ -484,8 +525,12 @@ program
     const g = await engine.graph(dir, {
       llm: deep,
       concurrency,
+      seedIn: opts.seedIn,
+      seedOut: opts.seedOut,
       reuse: opts.reuse,
-      lsp: opts.lsp,
+      // An explicit flag wins for this run; otherwise honour what was persisted,
+      // so `graft build` keeps the enrichment the last `--lsp` build asked for.
+      lsp: lspWasExplicit ? opts.lsp : readLspEnabled(resolve(dir)),
       onlyDirs,
       onProgress: ({ phase, index, total, file }) =>
         process.stderr.write(
@@ -500,6 +545,13 @@ program
     console.log(`  parsed: ${g.parsed} of ${g.files} files (${g.reused} replayed from cache)`);
     // Worth one line: this build started from a graph the user never built *here*.
     if (g.seededFrom) console.log(`  seeded: copied a starting graph from ${g.seededFrom} (git worktree)`);
+    // Silence here would be indistinguishable from a seed that matched nothing —
+    // the failure mode a wrong-repo or long-stale file actually produces.
+    if (opts.seedIn) {
+      const pct = g.nodes ? Math.round((100 * (g.seededSummaries ?? 0)) / g.nodes) : 0;
+      console.log(`  seed: folded ${g.seededSummaries ?? 0} of ${g.nodes} nodes from ${opts.seedIn} (${pct}%)`);
+    }
+    if (g.wroteSeed) console.log(`  seed: wrote ${g.wroteSeed.nodes} summaries → ${g.wroteSeed.path}`);
     if (deep) {
       const m = g.meaning;
       console.log(`  meaning: ${m.computed} computed, ${m.cached} cached, ${m.stale} stale, ${m.pending} pending`);

@@ -20,7 +20,12 @@
 import { resolve } from "node:path";
 import { relPosix } from "../util/paths.js";
 import { contextDirFor } from "../context/node-file.js";
-import { extractFile, languageOf } from "./extract.js";
+import {
+  extractFile,
+  isDepthReady,
+  languageOf,
+  warmDepthGrammars,
+} from "./extract.js";
 import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
 import { containerLangOf, extractContainer, warmContainerGrammars } from "./container.js";
 import { listSourceFiles } from "./build.js";
@@ -87,6 +92,11 @@ export async function checkGraph(
   const fpOnlyDirs = readFingerprint(outDir)?.onlyDirs;
   const onlyDirs = fpOnlyDirs && fpOnlyDirs.length > 0 ? new Set(fpOnlyDirs) : undefined;
   const sourceFiles = listSourceFiles(root, outDir, undefined, onlyDirs);
+  await warmDepthGrammars(
+    sourceFiles
+      .map((f) => languageOf(f))
+      .filter((lang): lang is NonNullable<typeof lang> => lang !== null),
+  );
   await warmGenericGrammars(
     new Set(sourceFiles.map((f) => genericLangOf(f)?.name).filter((n): n is string => !!n)),
   );
@@ -103,7 +113,8 @@ export async function checkGraph(
     // stay in step: a tier the build extracts and the check cannot see reports as
     // `removed` forever, and the `graft build` the check tells you to run can never
     // repair it.
-    const lang = languageOf(file);
+    const candidate = languageOf(file);
+    const lang = candidate && isDepthReady(candidate) ? candidate : null;
     const container = lang ? null : containerLangOf(file);
     const generic = lang || container ? null : genericLangOf(file);
     let source: string | null;

@@ -28,6 +28,10 @@ export type { BuildResult, BuildProgress, CheckResult, GraphBuildResult, GraphCh
 export interface InitOptions {
   /** Code extensions to include. Default: {@link CODE_EXTENSIONS}. */
   extensions?: string[];
+  /** Prime the concepts cache from a seed file another build wrote. */
+  seedIn?: string;
+  /** Files summarized in parallel, and batches synthesized in parallel. */
+  concurrency?: number;
   /** Progress callback for long builds. */
   onProgress?: (info: BuildProgress) => void;
 }
@@ -47,6 +51,10 @@ export interface GraphRunOptions {
   lsp?: boolean;
   /** Repo-relative directory prefixes to limit the build to (`--only-dir`). */
   onlyDirs?: string[];
+  /** Fold summaries from a seed file another machine's build wrote. */
+  seedIn?: string;
+  /** Write this build's summaries to a seed file. */
+  seedOut?: string;
   onProgress?: GraphBuildOptions["onProgress"];
 }
 
@@ -65,6 +73,8 @@ export class Graft {
       model: this.modelLabel(),
       summarizer: this.summarizer(),
       synthesizer: this.synthesizer(),
+      seedIn: opts.seedIn,
+      concurrency: opts.concurrency,
       onProgress: opts.onProgress,
     });
   }
@@ -93,6 +103,8 @@ export class Graft {
       reuse: opts.reuse,
       lsp: opts.lsp,
       onlyDirs: opts.onlyDirs,
+      seedIn: opts.seedIn,
+      seedOut: opts.seedOut,
       onProgress: opts.onProgress,
     });
   }
@@ -131,6 +143,7 @@ export class Graft {
       model: this.cfg.model,
       baseUrl: this.cfg.baseUrl,
       headers: this.cfg.headers,
+      reasoningEffort: this.cfg.reasoningEffort,
     });
     return this._chatModel;
   }

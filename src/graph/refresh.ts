@@ -34,7 +34,7 @@
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { contextDirFor } from "../context/node-file.js";
-import { acquireLockIn, releaseLockIn } from "../util/state.js";
+import { acquireLockIn, readLspEnabled, releaseLockIn } from "../util/state.js";
 import { CACHE_DIR } from "../context/node-file.js";
 import { buildGraph } from "./build.js";
 import { driftCount, isClean, probeDrift, readFingerprint, type Drift } from "./fingerprint.js";
@@ -213,7 +213,19 @@ export async function ensureFreshGraph(root: string, opts: RefreshOptions = {}):
       // here so an auto-rebuild keeps the same limited file set instead of silently
       // widening to the whole tree.
       const onlyDirs = readFingerprint(outDir)?.onlyDirs;
-      await buildGraph(dir, { contextDir: opts.contextDir, graphOnly: true, onlyDirs });
+      // Honour the repo's persisted `--lsp` choice, but REPLAY only. Without
+      // this the first edit after an explicit `--lsp` build silently rebuilds
+      // without the compiler-grade edges it added — on a large Dart repo that is
+      // ~100k edges disappearing on the next keystroke. Actually consulting a
+      // server here is not an option: it costs tens of seconds before it answers
+      // anything (it indexes the workspace first), and this runs under a hook
+      // timeout measured in seconds. Replaying is ~1s and keeps the edges.
+      await buildGraph(dir, {
+        contextDir: opts.contextDir,
+        graphOnly: true,
+        onlyDirs,
+        lspReplayOnly: readLspEnabled(dir),
+      });
       invalidateGraphCaches(outDir);
       return { refreshed: true, drift: drift ?? undefined, note: seedNote };
     } finally {

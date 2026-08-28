@@ -1,0 +1,129 @@
+/**
+ * Tests for Dart extraction in the Tier-1 code graph. Dart normally uses the
+ * depth-tier extractor so it can preserve receiver and heritage information;
+ * the generic tags query remains available as a breadth-tier fallback when the
+ * depth grammar cannot be loaded. These assertions pin down the richer primary
+ * extraction path.
+ */
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { buildGraph } from "../src/graph/build.js";
+import { readGraph, wiringPath } from "../src/graph/write.js";
+import type { GraphV1, NodeV1 } from "../src/graph/types.js";
+
+const APP_DART = `typedef Handler = void Function(String s);
+
+const int topLevelConst = 3;
+
+int compute() => 42;
+
+enum Color { red, green }
+
+mixin Loggable {
+  void log(String m) {}
+}
+
+abstract class Base {
+  void doThing();
+}
+
+class Widget extends Base with Loggable implements Comparable<Widget> {
+  Widget(this.name);
+  Widget.named(this.name);
+
+  final String name;
+  static const kMax = 10;
+
+  int get length => name.length;
+  set length(int v) {}
+
+  @override
+  void doThing() {
+    log('hi');
+    compute();
+    final w = Widget('x');
+    w.doThing();
+  }
+}
+
+extension StringX on String {
+  String shout() => toUpperCase();
+}
+`;
+
+function buildDartGraph(): { graph: GraphV1; dir: string } {
+  const dir = mkdtempSync(join(tmpdir(), "graft-dart-"));
+  mkdirSync(join(dir, "lib"), { recursive: true });
+  writeFileSync(join(dir, "lib", "app.dart"), APP_DART);
+  return { graph: null as unknown as GraphV1, dir };
+}
+
+const namesOfKind = (nodes: NodeV1[], kind: string) =>
+  nodes.filter((n) => n.kind === kind).map((n) => n.name).sort();
+
+test("dart extraction emits callables, types and call edges", async () => {
+  const { dir } = buildDartGraph();
+  try {
+    await buildGraph(dir, {});
+    const graph = readGraph(wiringPath(join(dir, "graft")))!;
+    assert.ok(graph, "graph was written");
+
+    const dartNodes = graph.nodes.filter((n) => n.path.endsWith(".dart"));
+
+    // The walker fallback produced neither of these kinds for Dart.
+    const methods = namesOfKind(dartNodes, "method");
+    assert.ok(methods.includes("doThing"), `methods: ${methods.join(", ")}`);
+    assert.ok(methods.includes("log"), `methods: ${methods.join(", ")}`);
+    assert.ok(methods.includes("shout"), `methods: ${methods.join(", ")}`);
+    // A getter and a setter are both members, not fields.
+    assert.equal(methods.filter((m) => m === "length").length, 2);
+    // Both constructors are members, and the named one is distinguishable.
+    assert.ok(methods.includes("Widget"), `methods: ${methods.join(", ")}`);
+    assert.ok(methods.includes("Widget.named"), `methods: ${methods.join(", ")}`);
+    // Ids are scoped by their type, so a method name shared across classes is
+    // no longer ambiguous the way the breadth tier's flat `file#name` was.
+    assert.ok(dartNodes.some((n) => n.id.endsWith("#Widget.doThing")));
+
+    const functions = namesOfKind(dartNodes, "function");
+    assert.deepEqual(functions, ["compute"]);
+
+    const classes = namesOfKind(dartNodes, "class");
+    assert.deepEqual(classes, ["Base", "StringX", "Widget"]);
+    // `Comparable` is named by an implements clause, not defined here, and the
+    // extension's `on String` names a type it does not define either.
+    assert.ok(!classes.includes("Comparable"));
+    assert.ok(!classes.includes("String"));
+
+    assert.deepEqual(namesOfKind(dartNodes, "interface"), ["Loggable"]);
+    assert.deepEqual(namesOfKind(dartNodes, "enum"), ["Color"]);
+    assert.deepEqual(namesOfKind(dartNodes, "type"), ["Handler"]);
+
+    const constants = namesOfKind(dartNodes, "constant");
+    assert.ok(constants.includes("topLevelConst"));
+    assert.ok(constants.includes("kMax"));
+    // Enum constants are members of the enum, not separate enums.
+    assert.ok(constants.includes("red") && constants.includes("green"));
+
+    // Fields are variables; locals inside a body are not graph nodes at all.
+    assert.deepEqual(namesOfKind(dartNodes, "variable"), ["name"]);
+
+    // Calls attribute to the enclosing METHOD, not the class — the whole point
+    // of pairing a Dart signature with the body that follows it.
+    const calls = graph.edges.filter((e) => e.relation === "calls");
+    assert.ok(
+      calls.some((e) => e.source.endsWith("#Widget.doThing") && e.target.endsWith("#compute")),
+      `calls: ${calls.map((e) => `${e.source}->${e.target}`).join(", ")}`,
+    );
+
+    // Heritage: `extends Base with Loggable implements Comparable`.
+    const rel = (r: string) => graph.edges.filter((e) => e.relation === r).map((e) => e.target ?? "");
+    assert.ok(rel("extends").some((t) => t.endsWith("#Base")), `extends: ${rel("extends").join(", ")}`);
+    assert.ok(rel("implements").some((t) => t.endsWith("#Loggable")), `implements: ${rel("implements").join(", ")}`);
+
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

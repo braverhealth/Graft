@@ -16,16 +16,36 @@
 import { readFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { walkDir } from "../ingest/fs.js";
-import { contextDirFor, ensureGitignored, ensureSearchable } from "../context/node-file.js";
-import { extractFile, languageLabelOf, languageOf, type RawEdge } from "./extract.js";
-import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
-import { containerLangOf, extractContainer, warmContainerGrammars } from "./container.js";
+import {
+  contextDirFor,
+  ensureGitignored,
+  ensureSearchable,
+} from "../context/node-file.js";
+import {
+  extractFile,
+  languageLabelOf,
+  languageOf,
+  isDepthReady,
+  warmDepthGrammars,
+  type RawEdge,
+} from "./extract.js";
+import {
+  extractGeneric,
+  genericLangOf,
+  warmGenericGrammars,
+} from "./generic.js";
+import {
+  containerLangOf,
+  extractContainer,
+  warmContainerGrammars,
+} from "./container.js";
 import { contentHash } from "../util/id.js";
 import { relPosix } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
 import { readFollowNestedRepos, readFollowSubmodules, readIncludeDirs } from "../util/state.js";
 import {
   emptyExtractCache,
+  keepExtractCacheFresh,
   readExtractCache,
   writeExtractCache,
   type ExtractEntry,
@@ -35,11 +55,25 @@ import { seedGraph, type SeedResult } from "./seed.js";
 import { filterByOnlyDirs, listSourceStats } from "./source-files.js";
 import { resolveEdges, type GoModule } from "./resolve.js";
 import { enrichGraph, type EnrichStats } from "./enrich.js";
+import { readContextCache } from "../context/build.js";
+import { readSeedFile, writeSeedFile } from "./seed-file.js";
 import { readGraph, writeGraph, wiringPath } from "./write.js";
-import { writeCards, writeIndex, writeCovers, type CardStats } from "./cards.js";
+import {
+  writeCards,
+  writeIndex,
+  writeCovers,
+  type CardStats,
+} from "./cards.js";
 import { writeAskIndex } from "../ask/index-file.js";
 import { discoverScopes, scopeOf } from "./scopes.js";
-import type { GraphV1, Kind, NodeV1, Relation, ScopeV1 } from "./types.js";
+import type {
+  EdgeV1,
+  GraphV1,
+  Kind,
+  NodeV1,
+  Relation,
+  ScopeV1,
+} from "./types.js";
 import type { CruxSummarizer } from "../ai/crux.js";
 
 export { listSourceFiles } from "./source-files.js";
@@ -61,7 +95,9 @@ function applyMinSubstanceGuard(scopes: ScopeV1[], nodes: NodeV1[]): ScopeV1[] {
     const scope = scopeOf(node.path, scopes);
     counts.set(scope.prefix, (counts.get(scope.prefix) ?? 0) + 1);
   }
-  const kept = scopes.filter((s) => s.prefix === "" || (counts.get(s.prefix) ?? 0) >= MIN_SCOPE_NODES);
+  const kept = scopes.filter(
+    (s) => s.prefix === "" || (counts.get(s.prefix) ?? 0) >= MIN_SCOPE_NODES,
+  );
   if (kept.length === 0) return [{ prefix: "", label: "", markers: [] }];
   if (kept.length === 1 && kept[0].prefix === "") {
     return [{ prefix: "", label: "", markers: kept[0].markers }];
@@ -85,6 +121,13 @@ export interface GraphBuildOptions {
    * calls, breadth-tier calls). Off by default — needs a server on PATH and is
    * slower; the graph is fully functional without it. */
   lsp?: boolean;
+  /** Replay memoized LSP edges but never consult a language server. The
+   * automatic refresh path sets this: it runs under a hook timeout measured in
+   * seconds, while spawning a server costs tens of seconds before it answers
+   * anything (it has to index the workspace first). Replaying keeps the edges a
+   * previous explicit `--lsp` build derived; the files that changed simply carry
+   * none until the next such build. */
+  lspReplayOnly?: boolean;
   /** Run the Tier-2 LLM meaning pass. Absent → Tier-1 only (cache is still preserved). */
   summarizer?: CruxSummarizer;
   /** Max files summarized in parallel during the Tier-2 pass. Default is set in enrich. */
@@ -93,6 +136,12 @@ export interface GraphBuildOptions {
    * set, only files under these prefixes are indexed; the list is recorded in the
    * fingerprint so the freshness probe enumerates the same set. */
   onlyDirs?: string[];
+  /** Fold summaries from a seed file written by another machine's build
+   * (`--seed-in`). Only entries whose body hash matches the code here are used,
+   * so a seed can lower coverage but never make a summary wrong. */
+  seedIn?: string;
+  /** After building, write this build's summaries to a seed file (`--seed-out`). */
+  seedOut?: string;
   onProgress?: (info: {
     phase: "parse" | "enrich";
     index: number;
@@ -114,6 +163,11 @@ export interface GraphBuildResult {
   /** The parent checkout this build copied a starting graph from, when it was run in
    * a git worktree that had none of its own. See `./seed.ts`. */
   seededFrom?: string;
+  /** Summaries adopted from a `--seed-in` file — nodes this machine would
+   * otherwise have had to pay a model to describe. */
+  seededSummaries?: number;
+  /** Summaries written to a `--seed-out` file. */
+  wroteSeed?: { path: string; nodes: number };
   nodes: number;
   edges: number;
   byKind: Record<Kind, number>;
@@ -180,40 +234,68 @@ export async function buildGraph(
   // keeps its paid-for summaries, instead of being a cold parse of the whole repo.
   // No-ops everywhere else, including on an explicit cold build (`reuse: false`).
   const seed: SeedResult =
-    opts.reuse === false ? { seeded: false } : seedGraph(root, { contextDir: opts.contextDir });
+    opts.reuse === false
+      ? { seeded: false }
+      : seedGraph(root, { contextDir: opts.contextDir });
 
   // Tier-1 memo: unchanged files replay their last parse. `entries` is rebuilt
   // from scratch each run and keyed only by files currently on disk, so deletions
   // fall out of both the cache and the fingerprint with no separate pruning pass.
-  const priorExtract = opts.reuse === false ? emptyExtractCache() : readExtractCache(outDir);
+  const priorExtract =
+    opts.reuse === false ? emptyExtractCache() : readExtractCache(outDir);
   const entries: Record<string, ExtractEntry> = {};
+  // The files whose parse did NOT come from the memo. The LSP tier reuses this
+  // to ask a language server only about what moved.
+  const reparsed = new Set<string>();
   let parsed = 0;
   let reused = 0;
 
   // Breadth tier: WASM grammars load asynchronously, so warm the ones this repo
   // needs ONCE here (buildGraph is async) before the synchronous parse loop below
   // can call extractGeneric. Depth-tier (native) grammars need no warmup.
+  // Depth-tier grammars that are WASM (Dart) load asynchronously too, and must
+  // be ready before the synchronous parse loop reaches a file that needs one.
+  await warmDepthGrammars(
+    files
+      .map((f) => languageOf(f.abs))
+      .filter((l): l is NonNullable<typeof l> => !!l),
+  );
   await warmGenericGrammars(
-    new Set(files.map((f) => genericLangOf(f.abs)?.name).filter((n): n is string => !!n)),
+    new Set(
+      files
+        .map((f) => genericLangOf(f.abs)?.name)
+        .filter((n): n is string => !!n),
+    ),
   );
   // Container tier (.vue and friends) loads its wrapper grammars the same way,
   // for the same reason: extractContainer runs inside the sync loop below.
   await warmContainerGrammars(
-    new Set(files.map((f) => containerLangOf(f.abs)?.name).filter((n): n is string => !!n)),
+    new Set(
+      files
+        .map((f) => containerLangOf(f.abs)?.name)
+        .filter((n): n is string => !!n),
+    ),
   );
 
   files.forEach((f, i) => {
     const rel = f.rel;
-    opts.onProgress?.({ phase: "parse", index: i, total: files.length, file: rel });
+    opts.onProgress?.({
+      phase: "parse",
+      index: i,
+      total: files.length,
+      file: rel,
+    });
     // Depth tier (hand-written, native grammar) if a language claims the file;
     // otherwise the breadth tier (generic tags.scm over a WASM grammar).
-    const lang = languageOf(f.abs);
+    const candidate = languageOf(f.abs);
+    const lang = candidate && isDepthReady(candidate) ? candidate : null;
     // A container is neither tier: its wrapper grammar only locates the embedded
     // block, which then goes to the depth-tier extractor. Checked before the
     // breadth tier so a future grammar claiming .vue can't shadow it.
     const container = lang ? null : containerLangOf(f.abs);
     const generic = lang || container ? null : genericLangOf(f.abs);
-    const label = languageLabelOf(f.abs) ?? container?.name ?? generic?.name ?? "unknown";
+    const label =
+      languageLabelOf(f.abs) ?? container?.name ?? generic?.name ?? "unknown";
     const cached = priorExtract.files[rel];
 
     // Every file is read and hashed, every build — only the *parse* is memoized.
@@ -233,13 +315,26 @@ export async function buildGraph(
       errors.push(message);
       // Record it anyway (with the stat we do have) so the freshness probe's
       // fast path doesn't report this file as new on every single query.
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [], error: message };
+      entries[rel] = {
+        size: f.size,
+        mtimeMs: f.mtimeMs,
+        hash: "",
+        nodes: [],
+        rawEdges: [],
+        error: message,
+      };
       return;
     }
     if (source === null) {
       // Unsupported encoding (UTF-16BE) — a skip, never an error: recorded with
       // an empty entry so the freshness probe doesn't treat it as new every run.
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash: "", nodes: [], rawEdges: [] };
+      entries[rel] = {
+        size: f.size,
+        mtimeMs: f.mtimeMs,
+        hash: "",
+        nodes: [],
+        rawEdges: [],
+      };
       return;
     }
 
@@ -259,6 +354,7 @@ export async function buildGraph(
     }
 
     parsed++;
+    reparsed.add(rel);
     try {
       const { nodes: fileNodes, rawEdges: fileEdges } = lang
         ? extractFile(rel, source, lang)
@@ -269,11 +365,24 @@ export async function buildGraph(
       rawEdges.push(...fileEdges);
       sources.set(rel, source);
       langs.add(label);
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: fileNodes, rawEdges: fileEdges };
+      entries[rel] = {
+        size: f.size,
+        mtimeMs: f.mtimeMs,
+        hash,
+        nodes: fileNodes,
+        rawEdges: fileEdges,
+      };
     } catch (err) {
       const message = `${rel}: parse failed — ${err instanceof Error ? err.message : String(err)}`;
       errors.push(message);
-      entries[rel] = { size: f.size, mtimeMs: f.mtimeMs, hash, nodes: [], rawEdges: [], error: message };
+      entries[rel] = {
+        size: f.size,
+        mtimeMs: f.mtimeMs,
+        hash,
+        nodes: [],
+        rawEdges: [],
+        error: message,
+      };
     }
   });
 
@@ -283,12 +392,25 @@ export async function buildGraph(
   // and a cold build and an incremental build could disagree. The meaning layer
   // has its own cache (wiring.json itself, keyed on body_hash); this one is
   // strictly about not re-parsing.
-  writeExtractCache(outDir, {
-    ...emptyExtractCache(),
-    files: entries,
-  });
+  // Only rewrite the memo when it would actually differ. Serialising it is
+  // hundreds of megabytes on a large repo, and a build where every file replayed
+  // and none disappeared has nothing new to persist.
+  const memoUnchanged =
+    parsed === 0 &&
+    Object.keys(entries).length === Object.keys(priorExtract.files).length &&
+    Object.keys(entries).every((rel) => rel in priorExtract.files);
+  if (memoUnchanged) {
+    keepExtractCacheFresh(outDir);
+  } else {
+    writeExtractCache(outDir, {
+      ...emptyExtractCache(),
+      files: entries,
+    });
+  }
 
-  const edges = resolveEdges(nodes, rawEdges, { goModules: readGoModules(root, repoFiles) });
+  const edges = resolveEdges(nodes, rawEdges, {
+    goModules: readGoModules(root, repoFiles),
+  });
 
   // Guard 5 (minimum-substance): node counts aren't known until nodes are
   // assembled, so the merge-tiny-scopes-into-root guard runs here.
@@ -315,6 +437,26 @@ export async function buildGraph(
   // Read BEFORE the first checkpoint can overwrite wiring.json.
   const prior = readGraph(wiringPath(outDir));
   const priorById = new Map((prior?.nodes ?? []).map((n) => [n.id, n]));
+  // A seed stands in for a prior this machine never had. Local matching
+  // summaries win; seed entries are accepted only for the exact body hash.
+  let seeded = 0;
+  if (opts.seedIn) {
+    const seedEntries = (await readSeedFile(opts.seedIn)).nodes;
+    for (const node of nodes) {
+      const local = priorById.get(node.id);
+      if (local?.summary_state === "ready" && local.body_hash === node.body_hash) continue;
+      const entry = seedEntries.get(node.id);
+      if (!entry || entry.h !== node.body_hash) continue;
+      priorById.set(node.id, {
+        ...node,
+        summary: entry.s,
+        crux: entry.c ?? null,
+        summary_state: "ready",
+        body_hash: entry.h,
+      });
+      seeded++;
+    }
+  }
   const meaning = await enrichGraph(nodes, priorById, sources, {
     summarizer: opts.summarizer,
     concurrency: opts.concurrency,
@@ -329,14 +471,135 @@ export async function buildGraph(
   // Opt-in compiler-grade enrichment (adds lsp_resolved call edges in place).
   // Runs on the assembled graph so callee positions map back to nodes; never
   // touches the extraction cache (Tier-1 stays pristine, cold==incremental).
-  if (opts.lsp) {
+  if (opts.lsp || opts.lspReplayOnly) {
     const { enrichWithLsp } = await import("./lsp/enrich.js");
-    const r = await enrichWithLsp(graph, root);
+    const {
+      readLspEdgeCache,
+      writeLspEdgeCache,
+      emptyLspEdgeCache,
+      generationFor,
+      rememberGeneration,
+      MAX_GENERATIONS,
+    } = await import("./lsp/edge-cache.js");
+    type LspFileEntry = { hash: string; edges: EdgeV1[] };
+    const { pickServers } = await import("./lsp/registry.js");
+    const { genericLangOf: gl } = await import("./generic.js");
+
+    // Identity of the servers that would run, so a change in what's installed
+    // invalidates the memo rather than freezing one server's edges in place.
+    const languages = new Set<string>();
+    for (const n of graph.nodes) {
+      const l = gl(n.path)?.name ?? languageLabelOf(n.path);
+      if (l) languages.add(l);
+    }
+    const serverIds = pickServers(languages)
+      .map((sv) => sv.command)
+      .sort()
+      .join(",");
+
+    const cold = opts.reuse === false;
+    const prior = cold
+      ? emptyLspEdgeCache(serverIds)
+      : readLspEdgeCache(outDir, serverIds);
+    const nodeIds = new Set(graph.nodes.map((n) => n.id));
+    const byIdPath = new Map(graph.nodes.map((n) => [n.id, n.path]));
+    const seen = new Set(
+      graph.edges.map((e) => `${e.source}\0${e.relation}\0${e.target}`),
+    );
+
+    // Replay whatever the server already said about each file's CURRENT
+    // content. Keyed on the hash rather than on "did this file change", so a
+    // file that changed back — the return leg of a branch switch — replays
+    // instead of being asked again. An edge is dropped when either end no longer
+    // exists, because a different file changing can delete the node this one
+    // pointed at.
+    const carried: Record<string, LspFileEntry[]> = {};
+    for (const [rel, history] of Object.entries(prior.files)) {
+      if (!sources.has(rel)) continue; // gone from the repo
+      carried[rel] = history.slice(0, MAX_GENERATIONS);
+      const match = generationFor(carried, rel, entries[rel]?.hash);
+      if (!match) continue; // nothing stored for the bytes on disk right now
+      const live = match.edges.filter(
+        (e) => nodeIds.has(e.source) && nodeIds.has(e.target),
+      );
+      match.edges = live;
+      for (const e of live) {
+        const key = `${e.source}\0${e.relation}\0${e.target}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        graph.edges.push(e);
+      }
+    }
+
+    // Ask only about files with no stored answer for their current content.
+    // That covers a file that changed, one the memo never saw, and one whose
+    // language became servable since — without re-asking about anything already
+    // known, whichever branch it came from.
+    const unanswered = (rel: string) =>
+      !generationFor(prior.files, rel, entries[rel]?.hash);
+    const onlyFiles = cold
+      ? undefined
+      : new Set([...sources.keys()].filter(unanswered));
+    const r = opts.lspReplayOnly
+      ? {
+          added: 0,
+          queried: 0,
+          server: null,
+          addedEdges: [] as EdgeV1[],
+          queriedFiles: new Set<string>(),
+        }
+      : await enrichWithLsp(graph, root, { onlyFiles });
+
+    const next = emptyLspEdgeCache(serverIds);
+    next.files = carried;
+    // Every file this pass asked about gets an answer recorded, even an empty
+    // one: "asked, nothing to say" is what stops it being asked forever, which
+    // otherwise respawns a language server on a build with nothing to do.
+    if (!opts.lspReplayOnly) {
+      for (const rel of r.queriedFiles) {
+        rememberGeneration(next.files, rel, { hash: entries[rel]?.hash ?? "", edges: [] });
+      }
+      for (const rel of sources.keys()) {
+        if (unanswered(rel)) {
+          const hash = entries[rel]?.hash ?? "";
+          if (!generationFor(next.files, rel, hash)) {
+            rememberGeneration(next.files, rel, { hash, edges: [] });
+          }
+        }
+      }
+    }
+    for (const e of r.addedEdges) {
+      const rel = byIdPath.get(e.source);
+      if (!rel) continue;
+      const hash = entries[rel]?.hash ?? "";
+      const gen = generationFor(next.files, rel, hash);
+      if (gen) gen.edges.push(e);
+      else rememberGeneration(next.files, rel, { hash, edges: [e] });
+    }
+    writeLspEdgeCache(outDir, next);
+
     graph.meta.edgeCount = graph.edges.length;
-    opts.onProgress?.({ phase: "enrich", index: r.added, total: r.queried, file: `lsp:${r.server ?? "none"}` });
+    opts.onProgress?.({
+      phase: "enrich",
+      index: r.added,
+      total: r.queried,
+      file: `lsp:${r.server ?? "none"}`,
+    });
   }
 
   const graphPath = writeGraph(graph, outDir);
+
+  // Export before the projections below: the seed is derived purely from the
+  // graph's nodes, so a failure writing cards must not cost the artifact other
+  // machines are waiting on.
+  let wroteSeed: GraphBuildResult["wroteSeed"];
+  if (opts.seedOut) {
+    // Both LLM layers travel: per-symbol summaries from this graph, and the
+    // per-file prose the concepts pass caches separately. Shipping only the
+    // first left every consumer recomputing the second at full price.
+    const written = writeSeedFile(opts.seedOut, graph.nodes, {}, readContextCache(outDir));
+    wroteSeed = { path: opts.seedOut, nodes: written };
+  }
   // `ask`'s token/IDF sidecar — moves per-query corpus tokenization to build
   // time (~45% of query time on a 32k-node graph, profiled). Lives in the
   // cache dir; `ask` falls back to live tokenization when it's absent/stale.
@@ -351,7 +614,9 @@ export async function buildGraph(
   try {
     writeAskIndex(outDir, graph);
   } catch (err) {
-    errors.push(`ask-index: ${err instanceof Error ? err.message : String(err)}`);
+    errors.push(
+      `ask-index: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 
   // The fingerprint claims exactly one thing: "the graph on disk was built from
@@ -389,7 +654,8 @@ export async function buildGraph(
   const byKind = {} as Record<Kind, number>;
   for (const n of nodes) byKind[n.kind] = (byKind[n.kind] ?? 0) + 1;
   const byRelation = {} as Record<Relation, number>;
-  for (const e of edges) byRelation[e.relation] = (byRelation[e.relation] ?? 0) + 1;
+  for (const e of edges)
+    byRelation[e.relation] = (byRelation[e.relation] ?? 0) + 1;
 
   return {
     contextDir: outDir,
@@ -399,6 +665,8 @@ export async function buildGraph(
     parsed,
     reused,
     seededFrom: seed.from,
+    seededSummaries: seeded || undefined,
+    wroteSeed,
     nodes: nodes.length,
     edges: edges.length,
     byKind,
