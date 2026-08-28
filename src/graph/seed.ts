@@ -48,6 +48,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { ASK_INDEX_FILE } from "../ask/index-file.js";
 import { CACHE_DIR, contextDirFor } from "../context/node-file.js";
 import { EXTRACT_CACHE_PREFIX } from "./extract-cache.js";
+import { LSP_CACHE_PREFIX } from "./lsp/edge-cache.js";
 import { FINGERPRINT_PREFIX } from "./fingerprint.js";
 import { GRAPH_DIR, wiringPath } from "./write.js";
 
@@ -144,7 +145,14 @@ function seedable(rel: string): boolean {
   return (
     name === ASK_INDEX_FILE ||
     name.startsWith(`${EXTRACT_CACHE_PREFIX}.`) ||
-    name.startsWith(`${FINGERPRINT_PREFIX}.`)
+    name.startsWith(`${FINGERPRINT_PREFIX}.`) ||
+    // The language server's answers, which are the expensive ones to re-derive:
+    // without them a fresh worktree of the SAME commit re-queried every callable
+    // in the repo — minutes — to arrive at what the parent already knew. They
+    // travel for the same reason the parse memo does: every entry is keyed by
+    // the content hash of a repo-relative path, which a worktree of the same
+    // repository shares.
+    name.startsWith(`${LSP_CACHE_PREFIX}.`)
   );
 }
 

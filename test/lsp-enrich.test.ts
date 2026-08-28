@@ -6,8 +6,9 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { pickServer, LSP_SERVERS } from "../src/graph/lsp/registry.js";
+import { pickServer, pickServers, LSP_SERVERS } from "../src/graph/lsp/registry.js";
 import { enrichWithLsp } from "../src/graph/lsp/enrich.js";
+import { LspClient } from "../src/graph/lsp/client.js";
 import type { GraphV1 } from "../src/graph/types.js";
 
 test("pickServer: no languages present → no server", () => {
@@ -17,6 +18,37 @@ test("pickServer: no languages present → no server", () => {
 test("pickServer: a language no registered server covers → null", () => {
   assert.equal(pickServer(new Set(["cobol", "fortran"])), null);
 });
+
+test("dart is served by the Dart SDK's own analysis server", () => {
+  const dart = LSP_SERVERS.find((s) => s.languages.includes("dart"));
+  assert.ok(dart, "a registry row covers dart");
+  // `dart language-server` speaks LSP by default, but the flag is explicit so a
+  // future SDK default can't silently switch it to the legacy analyzer protocol.
+  assert.equal(dart!.command, "dart");
+  assert.deepEqual(dart!.args, ["language-server", "--protocol=lsp"]);
+  assert.equal(dart!.languageId, "dart");
+});
+
+test("pickServers returns every applicable server, not just the first", () => {
+  // Nothing installed for these, so both agree on the empty case regardless of
+  // what this machine happens to have on PATH.
+  assert.deepEqual(pickServers(new Set(["cobol"])), []);
+  assert.equal(pickServer(new Set(["cobol"])), null);
+
+  // Whatever this machine resolves, the single-pick answer must be the first of
+  // the multi-pick answer — pickServer is now defined in terms of pickServers.
+  const langs = new Set(LSP_SERVERS.flatMap((s) => s.languages));
+  const all = pickServers(langs);
+  // Each call spreads a fresh object, so compare by value, not identity.
+  assert.deepEqual(pickServer(langs), all[0] ?? null);
+  // Rows claim disjoint languages, so running all of them cannot double-count.
+  const seen = new Set<string>();
+  for (const s of all) {
+    for (const l of s.languages) {
+      assert.ok(!seen.has(l), `${l} claimed by more than one selected server`);
+      seen.add(l);
+    }
+  }});
 
 test("registry rows are well-formed (languages, command, languageId)", () => {
   for (const s of LSP_SERVERS) {
@@ -41,4 +73,23 @@ test("enrichWithLsp is a no-op when no server matches the repo's languages", asy
   assert.equal(r.server, null, "no server selected for an unsupported language");
   assert.equal(r.added, 0);
   assert.equal(graph.edges.length, before, "graph edges untouched");
+});
+
+test("a server that dies immediately degrades instead of crashing the process", async () => {
+  // `true` exits 0 at once, so every write lands on a closed stream — the shape
+  // of a language server that starts and then dies (clangd on a repo it cannot
+  // index). The writes are asynchronous, so their rejections have to be caught
+  // on the promise; unhandled, they terminate the build with ERR_STREAM_DESTROYED
+  // instead of skipping this tier.
+  const client = new LspClient("/usr/bin/true", [], process.cwd(), "cpp");
+  const ok = await client.initialize();
+  assert.equal(ok, false, "a dead server never initializes");
+
+  // Must not throw, and must not leave an unhandled rejection behind.
+  client.didOpen(new URL(import.meta.url).pathname);
+  assert.deepEqual(await client.prepareCallHierarchy(new URL(import.meta.url).pathname, { line: 0, character: 0 }), []);
+  await client.dispose();
+
+  // Give any stray rejection a turn of the loop to surface before we pass.
+  await new Promise((r) => setTimeout(r, 50));
 });
