@@ -325,6 +325,27 @@ test("extractorStamp: a real identity for the loaded extraction code", () => {
   assert.equal(s, extractorStamp(), "memoized — the cost is paid once per process");
 });
 
+test("a tags query is extractor input: the stamp moves when queries/ changes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "graft-stamp-queries-"));
+  mkdirSync(join(dir, "queries"), { recursive: true });
+  writeFileSync(join(dir, "queries", "elixir.scm"), "(call) @reference.call\n");
+  const base = stampDir(join(dir, "queries"), ".scm");
+  assert.ok(base, "a queries directory with a .scm stamps");
+
+  assert.equal(stampDir(join(dir, "queries"), ".scm"), base, "stable for identical input");
+
+  // Adding a language's query changes what every file of that language extracts
+  // to, while leaving every graft module byte-identical — so without the queries
+  // directory in the stamp, the memo replays the old, query-less symbols forever.
+  writeFileSync(join(dir, "queries", "dart.scm"), "(class_definition) @definition.class\n");
+  const afterNewQuery = stampDir(join(dir, "queries"), ".scm");
+  assert.notEqual(afterNewQuery, base, "a newly added query must count");
+
+  // Editing an existing query counts too.
+  writeFileSync(join(dir, "queries", "dart.scm"), "(enum_declaration) @definition.enum\n");
+  assert.notEqual(stampDir(join(dir, "queries"), ".scm"), afterNewQuery, "an edited query must count");
+});
+
 test("the stamp moves for any module in the extractor directory, not just one", () => {
   const dir = mkdtempSync(join(tmpdir(), "graft-stamp-"));
   writeFileSync(join(dir, "extract.js"), "export const a = 1;\n");

@@ -53,7 +53,9 @@ export function writeGraph(graph: GraphV1, outDir: string): string {
   // leave a full-size orphan behind that nothing ever cleans up.
   const tmp = `${path}.${process.pid}.tmp`;
   try {
-    writeFileSync(tmp, JSON.stringify(sorted, null, 2) + "\n");
+    // Machine-only and parsed by every consumer. Compact output saves tens of
+    // megabytes on large graphs and makes every read cheaper.
+    writeFileSync(tmp, JSON.stringify(sorted) + "\n");
     renameSync(tmp, path);
   } catch (e) {
     try {

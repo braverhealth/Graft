@@ -23,7 +23,7 @@
  * extraction code itself, caught by content-hashing it — see
  * {@link extractorStamp}. Neither asks anyone to remember to bump anything.
  */
-import { readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, rmSync, statSync, utimesSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, extname, join } from "node:path";
@@ -147,7 +147,18 @@ function computeStamp(): string | null {
     // `.js` when running from `dist/`, `.ts` under tsx — take the extension from
     // our own filename rather than guessing which layout we're in.
     const dir = dirname(self);
-    const hashed = stampDir(dir, extname(self), packageVersion(dir) ?? "");
+    // The tags queries are extractor input just as much as the modules are:
+    // adding queries/dart.scm changes what every .dart file extracts to, but
+    // leaves every .js/.ts module byte-identical. Folding the queries directory
+    // into the stamp is what makes a build after that change re-parse instead of
+    // replaying stale symbols from the memo.
+    // A layout with no queries/ at all must not throw here: computeStamp's catch
+    // would swallow it and return null, disabling the memo's identity entirely.
+    let queriesStamp = "";
+    try {
+      queriesStamp = stampDir(join(dir, "queries"), ".scm") ?? "";
+    } catch { /* no queries directory in this layout */ }
+    const hashed = stampDir(dir, extname(self), `${packageVersion(dir) ?? ""}${queriesStamp}`);
     if (hashed) return hashed;
     // Couldn't read the modules (bundled into one file, say). The version alone is
     // a weaker identity — it can't see a local edit — but it still turns over on
@@ -210,6 +221,28 @@ export function readExtractCache(outDir: string): ExtractCache {
  * unwritable cache dir must never fail the build (it only costs the next build its
  * reuse). Returns false when nothing was written, including the deliberate case of
  * having no extractor identity: a parse we can't attribute must never be replayed. */
+/**
+ * Mark this memo as the one still in use, without rewriting it.
+ *
+ * A build where nothing changed has nothing new to persist — serialising
+ * hundreds of megabytes to produce an identical file is pure cost. But the
+ * pruner keeps the most recently touched sidecars, so a memo that is never
+ * rewritten eventually looks like the stale one and gets deleted out from under
+ * the install that is actively using it. Touching it says "still mine" for the
+ * price of a stat.
+ */
+export function keepExtractCacheFresh(outDir: string): void {
+  const path = extractCachePath(outDir);
+  if (path === null) return;
+  try {
+    const now = new Date();
+    utimesSync(path, now, now);
+  } catch {
+    /* nothing to keep fresh yet */
+  }
+  pruneSidecars(join(outDir, CACHE_DIR), EXTRACT_CACHE_PREFIX);
+}
+
 export function writeExtractCache(outDir: string, cache: ExtractCache): boolean {
   const path = extractCachePath(outDir);
   if (path === null) return false;
