@@ -102,6 +102,18 @@ export interface BuildConfig {
    * checkout someone parked in the tree. Absent/false keeps the historical
    * boundary. */
   followNestedRepos?: boolean;
+  /** Glob patterns whose files this repo's graph leaves out entirely. Machine
+   * written code is the case this exists for: generated sources and vendored
+   * bundles parse fine and then dominate the graph, crowding real code out of
+   * every ranked answer and, on a `--deep` build, being paid for a summary
+   * nobody reads. Persisted like the rest, so the refresh path — which never
+   * sees a flag — enumerates the same files a flagged build did. */
+  exclude?: string[];
+  /** Whether `--lsp` compiler-grade enrichment applies to this repo. Persisted
+   * for the same reason `includeDirs` is: the automatic refresh path never sees
+   * a CLI flag, so without this every refresh silently drops the LSP edges the
+   * last explicit build paid for. */
+  lsp?: boolean;
 }
 
 /** Local, Git-ignored repository configuration. Kept outside generated
@@ -157,6 +169,18 @@ export function readFollowSubmodules(d: string): boolean {
 /** Missing and explicit false both retain the backwards-compatible default. */
 export function readFollowNestedRepos(d: string): boolean {
   return readBuildConfig(d)?.followNestedRepos === true;
+}
+
+/** The persisted `--exclude` globs for repo `d`; empty when none were set,
+ * which every caller treats as "index everything the walk found". */
+export function readExcludes(d: string): string[] {
+  return readBuildConfig(d)?.exclude ?? [];
+}
+
+/** The persisted `--lsp` choice. Missing counts as off, so a repo that never
+ * passed the flag is unaffected. */
+export function readLspEnabled(d: string): boolean {
+  return readBuildConfig(d)?.lsp === true;
 }
 // Best-effort read-modify-write; not atomic across concurrent processes, but acceptable
 // for episodic hook writes (worst case is a lost update, not corruption).
