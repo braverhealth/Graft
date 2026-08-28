@@ -23,6 +23,8 @@ export interface ChatModelConfig {
   baseUrl?: string;
   /** Extra default headers for OpenAI-compatible endpoints (e.g. OpenRouter `X-Title`). */
   headers?: Record<string, string>;
+  /** Passed through as `reasoning_effort`; ignored by wire formats without it. */
+  reasoningEffort?: string;
 }
 
 export function createChatModel(cfg: ChatModelConfig): ChatModel {
@@ -35,6 +37,7 @@ export function createChatModel(cfg: ChatModelConfig): ChatModel {
         model: cfg.model,
         baseUrl: cfg.baseUrl,
         headers: cfg.headers,
+        reasoningEffort: cfg.reasoningEffort,
       });
     case "litellm":
       return new LiteLLMChatModel({

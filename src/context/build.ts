@@ -11,6 +11,7 @@
  *      source files so staleness stays exact.
  *   5. Write one markdown file per node (preserving human notes) + a manifest.
  */
+import { readSeedFile } from "../graph/seed-file.js";
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { walkDir } from "../ingest/fs.js";
@@ -66,6 +67,9 @@ export interface BuildOptions {
   synthesizer: Synthesizer;
   /** Files summarized in parallel during phase 1. Default 8. Raised via `graft build -j`. */
   concurrency?: number;
+  /** Prime the cache from another build's seed. Entries match by hash, so a
+   * stale seed costs coverage rather than correctness. */
+  seedIn?: string;
   onProgress?: (info: BuildProgress) => void;
 }
 
@@ -122,6 +126,13 @@ export async function buildContext(dir: string, opts: BuildOptions): Promise<Bui
     .filter((f) => !f.startsWith(outDir));
 
   const cache = loadCache(outDir);
+  // Without this, a fresh checkout re-reads every file through a model.
+  if (opts.seedIn) {
+    const { context } = await readSeedFile(opts.seedIn);
+    // Local entries win: they were written with the file in front of them.
+    cache.summaries = { ...context.summaries, ...cache.summaries };
+    cache.synth = { ...(context.synth as BuildCache["synth"]), ...cache.synth };
+  }
   // Flush the summary cache to disk during phase 1 so a build interrupted
   // partway (session/rate limit, crash, Ctrl-C) resumes without re-summarizing
   // the files it already did. Throttled to keep disk churn negligible; on the
@@ -212,25 +223,38 @@ export async function buildContext(dir: string, opts: BuildOptions): Promise<Bui
   const batches = batchBySize(summarized, BATCH_CHAR_BUDGET);
   result.batches = batches.length;
 
-  const synthNodes: SynthNode[] = [];
-  for (let b = 0; b < batches.length; b++) {
-    opts.onProgress?.({ phase: "synthesize", index: b, total: batches.length, file: `batch ${b + 1}` });
-    const key = batchKey(batches[b], hashByPath);
-    let nodes = cache.synth[key];
-    // An empty array is a miss, not a hit: caching [] made a silent empty
-    // synthesis permanent, the same trap #177 closed for the meaning pass (#129).
-    const cached = Array.isArray(nodes) && nodes.length > 0;
-    if (!cached) {
-      nodes = await opts.synthesizer.synthesize(batches[b]);
-      if (nodes.length > 0) cache.synth[key] = nodes;
-      else delete cache.synth[key];
-    }
-    const links = nodes.reduce((n, node) => n + node.links.length, 0);
-    console.error(
-      `  synthesis batch ${b + 1}/${batches.length}: ${nodes.length} nodes, ${links} links${cached ? " (cached)" : ""}`,
-    );
-    synthNodes.push(...nodes);
-  }
+  // Batches are independent requests and the wait dominates, so they run
+  // concurrently like phase 1. mapWithConcurrency preserves order, keeping the
+  // assembled node list stable between runs.
+  let synthDone = 0;
+  const perBatch = await mapWithConcurrency(
+    batches,
+    Math.max(1, opts.concurrency ?? 8),
+    async (batch, b): Promise<SynthNode[]> => {
+      const key = batchKey(batch, hashByPath);
+      let nodes = cache.synth[key];
+      // Empty output is a miss, not a permanent cache hit (#129/#177).
+      const cached = Array.isArray(nodes) && nodes.length > 0;
+      if (!cached) {
+        nodes = await opts.synthesizer.synthesize(batch);
+        if (nodes.length > 0) cache.synth[key] = nodes;
+        else delete cache.synth[key];
+      }
+      // On completion, so the counter climbs rather than jumping.
+      opts.onProgress?.({
+        phase: "synthesize",
+        index: synthDone++,
+        total: batches.length,
+        file: `batch ${synthDone}`,
+      });
+      const links = nodes.reduce((n, node) => n + node.links.length, 0);
+      console.error(
+        `  synthesis batch ${b + 1}/${batches.length}: ${nodes.length} nodes, ${links} links${cached ? " (cached)" : ""}`,
+      );
+      return nodes;
+    },
+  );
+  const synthNodes: SynthNode[] = perBatch.flat();
   // Drop cache entries for batches we no longer produce, so it can't grow forever.
   // Skip empty arrays so a failed batch is retried on the next --deep, not frozen.
   cache.synth = Object.fromEntries(
@@ -381,6 +405,16 @@ function resolveSlug(table: Map<string, string>, name: string): string | undefin
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** The concepts cache for `outDir`, so a seed can carry it between machines. */
+export function contextCachePath(outDir: string): string {
+  return cachePath(outDir);
+}
+
+/** The concepts cache as stored, or empty when there is none. */
+export function readContextCache(outDir: string): BuildCache {
+  return loadCache(outDir);
 }
 
 function cachePath(outDir: string): string {
