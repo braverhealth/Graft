@@ -209,6 +209,26 @@ test('grepGraph: `in` is a path prefix, not a substring, and errors when it matc
   assert.equal(grepGraph(graph, repo, 'NEEDLE', { in: join('src', 'a.ts') }).filesSearched, 1);
 });
 
+test('grepGraph: indexes symbols with a constant number of graph-node walks', () => {
+  const d = mkdtempSync(join(tmpdir(), 'graft-grep-node-walks-'));
+  const nodes = ['a.txt', 'b.txt', 'c.txt'].map((path) => {
+    writeFileSync(join(d, path), 'NEEDLE\n');
+    return fileNode(path, 1);
+  });
+  let nodeWalks = 0;
+  Object.defineProperty(nodes, Symbol.iterator, {
+    value() {
+      nodeWalks++;
+      return Array.prototype[Symbol.iterator].call(this);
+    },
+  });
+
+  const r = grepGraph(graphOf(nodes), d, 'NEEDLE');
+
+  assert.equal(r.totalHits, 3);
+  assert.equal(nodeWalks, 2);
+});
+
 test('grepGraph: `fixed` escapes regex metacharacters — "a.b" does not match "axb"', () => {
   const d = mkdtempSync(join(tmpdir(), 'graft-grep-fixed-'));
   writeFileSync(join(d, 'x.txt'), 'axb\na.b literal line\n');
